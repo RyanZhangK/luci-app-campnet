@@ -1,6 +1,7 @@
 # luci-app-campnet — 校园网自动认证 + 多账号多播均衡
 
 [![License: WTFPL](https://img.shields.io/badge/License-WTFPL-brightgreen.svg)](LICENSE)
+[![OpenWrt](https://img.shields.io/badge/OpenWrt-Supported-brightgreen.svg)](https://openwrt.org/)
 
 面向 ImmortalWrt / OpenWrt（23.05 系，LuCI2 JS）的校园网 Portal 认证插件：
 **断线自动重连 + 每账号独立 macvlan WAN + mwan3 均衡（多账号带宽倍增）**，
