@@ -1,7 +1,7 @@
 #!/bin/sh
 # ============================================================
 # dial.sh —— 多账号多播均衡编排（带宽倍增）
-# setup   : 每条启用线路建立独立 WAN 通道并注入 mwan3 均衡
+# setup   : 每条启用线路建立独立 WAN 接口并注入 mwan3 均衡
 #           - type=macvlan 的线路 → netifd 托管 macvlan(campnet_<id>) + DHCP
 #           - 全部启用线路 → mwan3 interface/member + policy(campnet_bal)
 #           - 兜底 rule(campnet_rule)，自动置于 default_rule* 之前
@@ -111,7 +111,7 @@ mwan3_available() {
 	[ -x "$MWAN3_BIN" ] && [ -f /etc/config/mwan3 ]
 }
 
-# 参与均衡通道："iface|metric|weight" 列表（确定性顺序、去重）
+# 参与均衡的线路："iface|metric|weight" 列表（确定性顺序、按接口去重）
 _balance_targets() {
 	local l acc devname seen out
 	seen=""; out=""
@@ -122,7 +122,7 @@ _balance_targets() {
 		devname=$(line_iface "$l")
 		case " $seen " in
 			*" $devname "*)
-				log WARN "dial: 线路[$l] 与其它线路共用通道 $devname，已跳过（检查 campnet.$l.ifbase）"
+				log WARN "dial: 线路[$l] 与其它线路共用接口 $devname，已跳过（检查 campnet.$l.ifbase）"
 				continue ;;
 		esac
 		seen="$seen $devname"
@@ -155,7 +155,7 @@ _unmark() {
 # 流量黑洞，而不是自动回落到默认策略。
 # ------------------------------------------------------------
 _prune_resources() {
-	local keep l s z net devname
+	local keep l s z net devname allids f
 
 	# 保留集：仍然启用且已绑定账号的 macvlan 线路的设备名
 	keep=""
@@ -210,6 +210,35 @@ _prune_resources() {
 		_unmark mwan3member "$s"
 		DIRTY=1
 	done
+
+	# 状态文件与 cookie：线路段被删掉之后这两样会永久残留 ——
+	# state 留着陈旧状态（总览页会继续显示一条不存在的线路的旧 IP），
+	# cookie 留着上一张 0600 的会话票据，仍然是一份凭据。
+	# CLI 的 `line del` 会顺手清理，但界面上的删除走的是 uci（提交时落盘），
+	# 所以这里按「uci 里还存在的线路」统一回收，两条路径行为一致。
+	# 判据用 camp_line_ids 而不是 keep：wan 型线路没有设备，同样要清。
+	#
+	# 保险：只在 uci **确实可读**时才动手。`uci show campnet` 整体失败时
+	# camp_line_ids 也是空的，那就成了"所有线路都被删了"的误判，
+	# 会一次性清掉全部状态与 cookie。settings 段存在即说明配置读得到。
+	if [ -n "$(uciq campnet.settings)" ]; then
+		allids=" $(camp_line_ids | tr '\n' ' ') "
+		for f in "$CAMP_STATE_DIR"/*.state; do
+			[ -e "$f" ] || continue
+			z=$(basename "$f" .state)
+			case "$allids" in *" $z "*) continue ;; esac
+			log INFO "dial: 回收已删除线路的状态文件 $z.state"
+			rm -f "$f"
+		done
+		for f in "$COOKIE_PREFIX".*.jar; do
+			[ -e "$f" ] || continue
+			z=${f#"$COOKIE_PREFIX".}
+			z=${z%.jar}
+			case "$allids" in *" $z "*) continue ;; esac
+			log INFO "dial: 回收已删除线路的 cookie（$z）"
+			rm -f "$f"
+		done
+	fi
 	return 0
 }
 
@@ -248,7 +277,7 @@ dial_net_setup() {
 		# 短名撞车（哈希碰撞）宁可报错也不能静默共用一条线路
 		case " $used_names " in
 			*" $base "*)
-				log ERROR "dial: 线路[$l] 的通道短名 '$base' 与其它线路冲突，已跳过；请改名或手填 campnet.$l.ifbase"
+				log ERROR "dial: 线路[$l] 的短名 '$base' 与其它线路冲突，已跳过；请改名或手填 campnet.$l.ifbase"
 				continue ;;
 		esac
 		used_names="$used_names $base"
@@ -322,14 +351,14 @@ dial_net_setup() {
 }
 
 # ------------------------------------------------------------
-# pass2：mwan3 均衡（≥2 条通道才注入）
+# pass2：mwan3 均衡（≥2 条线路才注入）
 # ------------------------------------------------------------
 dial_mwan3_setup() {
 	local targets n t iface metric weight member desired cur metric_mismatch member_metric oldm
 	targets=$(_balance_targets)
 	n=$(echo $targets | wc -w)
 	[ "$n" -ge 2 ] || {
-		# 不足两条通道时必须把本插件的 mwan3 配置撤干净。
+		# 不足两条线路时必须把本插件的 mwan3 配置撤干净。
 		# 否则 policy 会指向已删除的接口 —— mwan3 遇到这种引用是流量黑洞，
 		# 而不是自动回落到默认策略。
 		local kind had=0
@@ -342,9 +371,9 @@ dial_mwan3_setup() {
 		if [ "$had" = "1" ]; then
 			uci -q commit mwan3 2>/dev/null
 			mwan3_available && "$MWAN3_BIN" restart >/dev/null 2>&1
-			log INFO "dial: 可用通道 $n 条（<2），已撤除 mwan3 均衡配置"
+			log INFO "dial: 可用线路 $n 条（<2），已撤除 mwan3 均衡配置"
 		else
-			log INFO "dial: 可用通道 $n 条（<2），无需 mwan3 均衡"
+			log INFO "dial: 可用线路 $n 条（<2），无需 mwan3 均衡"
 		fi
 		return 0
 	}
@@ -422,7 +451,7 @@ dial_mwan3_setup() {
 
 	if [ "$metric_mismatch" = "1" ]; then
 		log WARN "dial: 各账号 mwan3 metric 不一致（$(echo $targets | tr ' ' ',')）——" \
-			"mwan3 只会选用 metric 最小的那批通道，结果是故障切换而非带宽叠加；" \
+			"mwan3 只会选用 metric 最小的那批线路，结果是故障切换而非带宽叠加；" \
 			"需要均衡请把所有参与账号的 metric 设为同一个值"
 	fi
 

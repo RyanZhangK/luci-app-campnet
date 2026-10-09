@@ -17,6 +17,8 @@
 #   campnet account del <名>                删除账号（连同其线路）
 #   campnet secret show [账号]              查看是否已配置帐密（脱敏）
 #   campnet secret set <用户名> [密码] [账号] 保存帐密（写入 /etc/campnet/.config）
+#                                          密码写 "-" 表示从 stdin 读，不进 argv
+#   campnet secret del <账号>               删除该账号的帐密分节
 #   campnet dial {setup|teardown|status}    线路编排（建/删 macvlan 与 mwan3）
 #   campnet test [线路]                     连通性自检
 #   campnet log [行数]                       最近日志（默认 120 行）
@@ -128,10 +130,6 @@ cmd_line() {
 			# uci 的 section id 全局唯一：线路名撞上账号名会把账号段覆盖掉
 			[ -z "$(uciq "campnet.$name")" ] \
 				|| { echo "名字[$name] 已被占用（账号与线路共用一个命名空间）" >&2; return 1; }
-			local n
-			n=$(acct_line_count "$acct")
-			[ "$n" -lt "$LINE_PER_ACCOUNT_MAX" ] \
-				|| { echo "账号[$acct] 已有 $n 条线路，达到上限 $LINE_PER_ACCOUNT_MAX" >&2; return 1; }
 			case "$type" in
 				wan|macvlan) ;;
 				*) echo "线路类型只能是 wan 或 macvlan（收到: $type）" >&2; return 1 ;;
@@ -238,7 +236,14 @@ case "${1:-}" in
 		case "${1:-show}" in
 			show) cmd_secret_show "$2" ;;
 			set) shift; cmd_secret_set "$@" ;;
-			*) echo "用法: campnet secret {show [账号] | set <用户> [密码] [账号]}" >&2; exit 1 ;;
+			del)
+				# 必须显式给账号：secret_delete 对空参数会退化成 main，
+				# 而"删掉主账号凭据"这种后果不该由一个手滑的空参数触发。
+				[ -n "$2" ] || { echo "用法: campnet secret del <账号>" >&2; exit 1; }
+				secret_delete "$2"
+				echo "已删除账号[$2] 的帐密分节"
+				;;
+			*) echo "用法: campnet secret {show [账号] | set <用户> [密码|-] [账号] | del <账号>}" >&2; exit 1 ;;
 		esac
 		;;
 	test) shift; cmd_test "$@" ;;

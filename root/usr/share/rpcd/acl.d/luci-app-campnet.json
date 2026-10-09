@@ -23,6 +23,7 @@
 					"auth",
 					"portal",
 					"setSecret",
+					"deleteSecret",
 					"lineApply",
 					"lineTeardown",
 					"setService"

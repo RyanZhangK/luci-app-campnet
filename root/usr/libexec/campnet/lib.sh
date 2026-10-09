@@ -176,10 +176,10 @@ load_settings() {
 #
 # 模型：account 只描述「身份」（凭据 + 是否启用）；line 才是实体，
 # 一条 line = 一条独立认证会话 = 一个 procd keeper 实例 = 一份状态文件。
-# line 必须绑定一个 account，且同一 account 名下线路总数有上限
-# （LINE_PER_ACCOUNT_MAX，校园网对同账号并发会话有限制）。
+# line 必须绑定一个 account；账号名下的线路数**不设上限** ——
+# 校园网侧对同账号并发会话通常有限制，但那应该由门户拒绝并在日志里看得见，
+# 而不是由插件在前端拦下来（v1.0.x 的每账号 2 条上限已移除）。
 # ------------------------------------------------------------
-LINE_PER_ACCOUNT_MAX=2
 
 _uci_sections() { # <类型>
 	uci show campnet 2>/dev/null | grep -E "^campnet\.[^=]+=$1$" \
@@ -190,8 +190,16 @@ camp_account_ids() { _uci_sections account; }
 camp_line_ids()    { _uci_sections line; }
 
 acct_opt()     { uciq "campnet.$1.$2"; }
-acct_enabled() { uciqn "campnet.$1.enabled" 1; }
 acct_exists()  { [ -n "$(uciq "campnet.$1")" ]; }
+
+# 段**不存在**时返回 0（停用），而不是 uciqn 的默认值 1。
+# 这个默认值曾是个静默失败：删掉账号后，其名下线路在 run_login / keeper 里
+# 仍被当作「账号已启用」而继续认证 —— 带着 .config 里可能残留的凭据。
+# 孤儿线路必须显式判为停用，后面由 keeper 自然不再拉起。
+acct_enabled() {
+	acct_exists "$1" || { echo 0; return 0; }
+	uciqn "campnet.$1.enabled" 1
+}
 
 line_opt()     { uciq "campnet.$1.$2"; }
 line_enabled() { uciqn "campnet.$1.enabled" 1; }
@@ -301,7 +309,7 @@ camp_migrate_legacy() {
 			uci -q set "campnet.$l.metric=$(uciqn "campnet.$acc.metric" 10)"
 			uci -q set "campnet.$l.weight=$(uciqn "campnet.$acc.weight" 10)"
 			uci -q set "campnet.$l.route_metric=$(uciqn "campnet.$acc.route_metric" 20)"
-			# 把旧的通道短名搬到线路段上，这样 macvlan 设备名（campnet_<base>）
+			# 把旧的短名搬到线路段上，这样 macvlan 设备名（campnet_<base>）
 			# 与 mwan3 里已有的接口名都不变，认证与均衡不受影响。
 			ob=$(acct_opt "$acc" ifbase)
 			[ -n "$ob" ] || ob=$(base_of "$acc")

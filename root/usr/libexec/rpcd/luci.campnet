@@ -77,6 +77,8 @@ case "$1" in
 		json_close_object
 		json_add_object "getLog"
 			json_add_string "lines" "string"
+			json_add_string "level" "string"
+			json_add_string "line" "string"
 		json_close_object
 		json_add_object "auth"
 			json_add_string "line" "string"
@@ -92,6 +94,9 @@ case "$1" in
 			json_add_string "account" "string"
 			json_add_string "username" "string"
 			json_add_string "password" "string"
+		json_close_object
+		json_add_object "deleteSecret"
+			json_add_string "account" "string"
 		json_close_object
 		json_add_object "lineApply"
 		json_close_object
@@ -113,14 +118,37 @@ case "$1" in
 				;;
 			getLog)
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
-				bad=$(_bad_param lines)
-				json_get_var lines lines; json_cleanup 2>/dev/null
+				bad=$(_bad_param lines level line)
+				json_get_var lines lines
+				json_get_var level level
+				json_get_var line line
+				json_cleanup 2>/dev/null
 				# 非数字就退回默认行数：坏值直接塞给 tail 会得到空输出，
 				# 前端把「读取失败」显示成「暂无日志」，问题就此隐身。
 				case "$lines" in ''|*[!0-9]*) lines=120 ;; esac
+				[ "$lines" -gt 2000 ] && lines=2000
+				# 级别白名单；线路名只允许 uci section id 的合法字符集（防注入到 grep 模式）
+				case "$level" in INFO|WARN|ERROR) ;; *) level="" ;; esac
+				case "$line"  in *[!A-Za-z0-9_.-]*) line="" ;; esac
+
+				# 过滤必须在**后端**做，而且必须是「先过滤、再取尾」。
+				# 旧实现只 tail、过滤交给前端，于是"最近 200 行里没有 ERROR"
+				# 会被显示成「没有错误」，而 300 行之前可能刚有一条。
+				pat=""
+				[ -n "$level" ] && pat="\[$level\]"
+				if [ -n "$line" ]; then
+					# 线路名里的 . 在 ERE 里是通配，必须转义
+					lpat=$(printf '%s' "$line" | sed 's/[][\\.*^$]/\\&/g')
+					pat="${pat}.*线路\[${lpat}\]"
+				fi
+				if [ -n "$pat" ]; then
+					logtext=$(grep -E "$pat" "$CAMP_LOG" 2>/dev/null | tail -n "$lines")
+				else
+					logtext=$(tail -n "$lines" "$CAMP_LOG" 2>/dev/null)
+				fi
 				json_init
-				json_add_string "log" "$(tail -n "$lines" "$CAMP_LOG" 2>/dev/null)"
-				[ -n "$bad" ] && json_add_string "warn" "参数 $bad 类型非法，已回退默认行数"
+				json_add_string "log" "$logtext"
+				[ -n "$bad" ] && json_add_string "warn" "参数 $bad 类型非法，已忽略"
 				json_dump
 				;;
 			auth)
@@ -192,6 +220,16 @@ case "$1" in
 				else
 					fail_json "用户名与密码都不能为空"
 				fi
+				;;
+			deleteSecret)
+				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
+				get_arg account "" || exit 0
+				account="$ARG_VAL"
+				json_cleanup 2>/dev/null
+				# 空账号会让 secret_delete 退化成 main —— 即"删掉主账号凭据"。
+				# 这种后果不能由一个手滑的空参数触发，显式拒绝。
+				[ -n "$account" ] || { fail_json "缺少账号名"; exit 0; }
+				run_cli "$CAMP" secret del "$account"
 				;;
 			lineApply)
 				# 同 auth：编排涉及 mwan3 restart 与 firewall reload，耗时不可控，

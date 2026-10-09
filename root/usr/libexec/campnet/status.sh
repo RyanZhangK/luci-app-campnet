@@ -79,23 +79,29 @@ json_status() {
 
 	json_add_string "version" "$(camp_version)"
 	json_add_int "keepers" "$(_service_keepers)"
-	json_add_int "line_limit" "$LINE_PER_ACCOUNT_MAX"
 
 	# ---- 线路 ----
-	local online=0 total=0
+	# total/online 只统计**启用**的线路：停用是用户有意关掉的，
+	# 把它算进分母会让状态页横幅永远显示"未全部在线" —— 一个假警报。
+	# 停用的线路仍会出现在 lines[] 里（表格上标「已停用」），只是不计入分母。
+	local online=0 total=0 nall=0 en
 	json_add_array "lines"
 	for l in $(camp_line_ids); do
-		total=$((total + 1))
+		nall=$((nall + 1))
 		acc=$(line_account "$l")
 		iface=$(line_iface "$l"); dev=$(iface_to_dev "$iface")
 		ip=$(dev_ip "$dev"); mac=$(dev_mac "$dev")
 		st=$(_line_state "$l" status)
 		msg=$(state_read "$l" msg)
-		[ "$st" = "authenticated" ] && online=$((online + 1))
+		en=$(line_enabled "$l")
+		if [ "$en" = "1" ]; then
+			total=$((total + 1))
+			[ "$st" = "authenticated" ] && online=$((online + 1))
+		fi
 
 		json_add_object ""
 			json_add_string "id" "$l"
-			json_add_boolean "enabled" "$(line_enabled "$l")"
+			json_add_boolean "enabled" "$en"
 			json_add_string "account" "${acc:-}"
 			json_add_string "type" "$(line_type "$l")"
 			json_add_string "iface" "$iface"
@@ -114,23 +120,35 @@ json_status() {
 	json_close_array
 
 	# ---- 账号（身份）----
-	local ids n
+	local ids n cred uname_
 	json_add_array "accounts"
 	ids=$(camp_account_ids)
 	for acc in $ids; do
 		n=$(acct_line_count "$acc")
+		# 凭据是否已配置，以及**用户名**（仅用于 UI 回填）。
+		# 没有它，「只改密码」就要求用户把学号重新完整敲一遍 ——
+		# 最常用的操作反而最容易失败。密码本身绝不外传。
+		# secret_read 会把用户名/密码写进全局 USERNAME/PASSWORD，故不能放进 $( )。
+		cred=0; uname_=""
+		if secret_read "$acc" >/dev/null 2>&1; then
+			cred=1; uname_="$USERNAME"
+		fi
 		json_add_object ""
 			json_add_string "id" "$acc"
 			json_add_boolean "enabled" "$(acct_enabled "$acc")"
 			json_add_int "lines" "$n"
-			json_add_boolean "has_credential" "$(_cred_ok "$acc")"
+			json_add_boolean "has_credential" "$cred"
+			json_add_string "username" "$uname_"
 			# 该账号名下的线路（供 UI 表达归属关系）
 			json_add_string "line_ids" "$(acct_line_ids "$acc" | tr '\n' ' ')"
 		json_close_object
 	done
 	json_close_array
 
+	# total/online = 仅启用线路；lines_all = 全部线路（含停用）。
+	# 两者一起给出，UI 才能区分「一条线路都没配」和「配了但全停用了」。
 	json_add_int "total" "$total"
 	json_add_int "online" "$online"
+	json_add_int "lines_all" "$nall"
 	json_dump
 }

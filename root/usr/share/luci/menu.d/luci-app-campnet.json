@@ -10,7 +10,7 @@
 		}
 	},
 	"admin/services/campnet/overview": {
-		"title": "状态总览",
+		"title": "状态",
 		"order": 1,
 		"action": {
 			"type": "view",
