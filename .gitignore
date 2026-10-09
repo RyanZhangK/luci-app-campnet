@@ -33,3 +33,10 @@ dl/
 *.apk
 *.a
 *.o
+
+# ---- 不随包发布：开发文档与自测脚本 ----
+# 保留在本地磁盘（自己跑测试/看设计笔记），但不推到 GitHub。
+docs/
+tests/
+scripts/
+.config.example

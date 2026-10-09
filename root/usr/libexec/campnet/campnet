@@ -1,15 +1,28 @@
 #!/bin/sh
 # ============================================================
-# campnet —— 校园网认证 + 多播均衡 命令行入口
+# campnet —— 校园网认证 + 多线路多播均衡 命令行入口
+#
+# 模型：account = 身份（凭据）；line = 一条独立认证会话（绑定一个账号）。
+#
 # 用法:
-#   campnet auth [all|<账号>] [--force]    立即登录（不指定=all）
 #   campnet status [-j]                     状态（-j 输出 JSON）
-#   campnet dial {setup|teardown|status}    多播线路编排
+#   campnet auth [all|<线路>] [--force]      立即登录（不指定=all）
+#   campnet portal [线路]                    查看门户回传的实名信息
+#   campnet line list                       列出线路
+#   campnet line add <名> <账号> [macvlan]   新建线路（默认 macvlan）
+#   campnet line del <名>                   删除线路
+#   campnet account list                    列出账号
+#   campnet account add <名>                新建账号
+#   campnet account del <名>                删除账号（连同其线路）
+#   campnet secret show [账号]              查看是否已配置帐密（脱敏）
+#   campnet secret set <用户名> [密码] [账号] 保存帐密（写入 /etc/campnet/.config）
+#   campnet dial {setup|teardown|status}    线路编排（建/删 macvlan 与 mwan3）
+#   campnet test [线路]                     连通性自检
 #   campnet log [行数]                       最近日志（默认 120 行）
-#   campnet secret show [账号]              查看已配置账号(脱敏)
-#   campnet secret set <用户名> [密码] [账号] 保存/修改帐密（写入 /etc/campnet/.config）
-#   campnet test [账号]                     连通性自检
-#   campnet {enable|disable|start|stop|restart|status-service}  服务控制
+#   campnet version                         当前版本
+#   campnet checkupdate [--refresh]         检查 GitHub 最新版本
+#   campnet migrate                         把 v0.x 旧配置迁移到当前模型
+#   campnet {enable|disable|start|stop|restart|reload}  服务控制
 # ============================================================
 
 CAMP_LIB=/usr/libexec/campnet/lib.sh
@@ -19,21 +32,22 @@ CAMP_LIB=/usr/libexec/campnet/lib.sh
 . "$(dirname "$0")/eportal.sh"
 
 usage() {
-	sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
 }
+
+# 全部启用线路，或指定的一条
+_all_lines() { camp_line_ids; }
 
 cmd_auth() {
 	local target="${1:-all}" force="${2:-}"
-	# 允许 campnet auth --force（等价 all）
 	[ "$target" = "--force" ] && { target="all"; force="--force"; }
 	load_settings
-	[ "$S_ENABLED" = "1" ] || { log WARN "插件已停用（uci campnet.settings.enabled=0）"; }
+	[ "$S_ENABLED" = "1" ] || log WARN "插件已停用（uci campnet.settings.enabled=0）"
 	if [ "$target" = "all" ]; then
-		local ids rc=0 acc
-		ids=$(camp_account_ids)
-		[ -n "$ids" ] || { echo "没有配置任何账号（uci campnet.account.*）"; return 1; }
-		for acc in $ids; do
-			run_login "$acc" "$force" || rc=1
+		local rc=0 l
+		[ -n "$(camp_line_ids)" ] || { echo "尚未配置任何线路（uci campnet.line.*）"; return 1; }
+		for l in $(_all_lines); do
+			run_login "$l" "$force" || rc=1
 		done
 		return $rc
 	fi
@@ -42,11 +56,7 @@ cmd_auth() {
 
 cmd_status() {
 	. "$(dirname "$0")/status.sh"
-	if [ "$1" = "-j" ]; then
-		json_status
-	else
-		text_status
-	fi
+	if [ "$1" = "-j" ]; then json_status; else text_status; fi
 }
 
 cmd_log() {
@@ -56,12 +66,23 @@ cmd_log() {
 	tail -n "$n" "$CAMP_LOG"
 }
 
+cmd_portal() {
+	load_settings
+	local l="${1:-}"
+	[ -n "$l" ] || l=$(camp_line_ids | head -1)
+	[ -n "$l" ] || { echo "尚未配置线路" >&2; return 1; }
+	dev=$(line_dev "$l")
+	echo "线路[$l] 门户回传信息："
+	portal_info "$dev" | while IFS= read -r kv; do
+		printf '  %-8s %s\n' "${kv%%=*}" "${kv#*=}"
+	done
+}
+
 cmd_secret_show() {
 	secret_seed
 	local acc="${1:-main}"
 	if secret_read "$acc"; then
-		echo "账号[$acc]: 用户名=$(printf '%s' "$USERNAME" | sed 's/./*/g') (已配置)"
-		echo "  提示: campnet secret set <用户名> <密码> [$acc]"
+		echo "账号[$acc]: 用户名=$(printf '%s' "$USERNAME" | sed 's/./*/g')（已配置）"
 	else
 		echo "账号[$acc]: 未配置帐密（/etc/campnet/.config）"
 	fi
@@ -77,40 +98,123 @@ cmd_secret_set() {
 		stty echo 2>/dev/null
 		printf '\n'
 	fi
+	secret_seed
 	secret_write "$acc" "$user" "$pass" || { echo "写入失败" >&2; return 1; }
-	chmod 600 "$CAMP_SECRET" 2>/dev/null
 	echo "账号[$acc] 帐密已保存到 $CAMP_SECRET (0600)"
 }
 
+# ---- 线路 / 账号 的增删（与 LuCI 走同一套 uci 结构）----
+cmd_line() {
+	local act="$1" name="$2" acct="$3" type="${4:-macvlan}"
+	case "$act" in
+		list)
+			local l
+			for l in $(camp_line_ids); do
+				printf '%-12s 账号=%-10s 类型=%-8s 启用=%s\n' \
+					"$l" "$(line_account "$l")" "$(line_type "$l")" "$(line_enabled "$l")"
+			done
+			;;
+		add)
+			[ -n "$name" ] && [ -n "$acct" ] || { echo "用法: campnet line add <名> <账号> [macvlan|wan]" >&2; return 1; }
+			acct_exists "$acct" || { echo "账号[$acct] 不存在，请先 campnet account add $acct" >&2; return 1; }
+			# uci 的 section id 全局唯一：线路名撞上账号名会把账号段覆盖掉
+			[ -z "$(uciq "campnet.$name")" ] \
+				|| { echo "名字[$name] 已被占用（账号与线路共用一个命名空间）" >&2; return 1; }
+			local n
+			n=$(acct_line_count "$acct")
+			[ "$n" -lt "$LINE_PER_ACCOUNT_MAX" ] \
+				|| { echo "账号[$acct] 已有 $n 条线路，达到上限 $LINE_PER_ACCOUNT_MAX" >&2; return 1; }
+			uci -q set "campnet.$name=line"
+			uci -q set "campnet.$name.enabled=1"
+			uci -q set "campnet.$name.account=$acct"
+			uci -q set "campnet.$name.type=$type"
+			[ "$type" = "wan" ] && uci -q set "campnet.$name.iface=wan"
+			uci -q commit campnet
+			echo "已新建线路[$name] → 账号[$acct]（$type）"
+			;;
+		del)
+			[ -n "$name" ] || { echo "用法: campnet line del <名>" >&2; return 1; }
+			[ -n "$(uciq "campnet.$name")" ] || { echo "线路[$name] 不存在" >&2; return 1; }
+			uci -q delete "campnet.$name"
+			uci -q commit campnet
+			rm -f "$CAMP_STATE_DIR/$name.state"
+			echo "已删除线路[$name]"
+			;;
+		*) echo "用法: campnet line {list|add|del}" >&2; return 1 ;;
+	esac
+}
+
+cmd_account() {
+	local act="$1" name="$2"
+	case "$act" in
+		list)
+			local a
+			for a in $(camp_account_ids); do
+				printf '%-12s 启用=%s 线路数=%s 帐密=%s\n' \
+					"$a" "$(acct_enabled "$a")" "$(acct_line_count "$a")" \
+					"$([ "$(_cred_ok2 "$a")" = "1" ] && echo 已配置 || echo 未配置)"
+			done
+			;;
+		add)
+			[ -n "$name" ] || { echo "用法: campnet account add <名>" >&2; return 1; }
+			[ -z "$(uciq "campnet.$name")" ] || { echo "账号[$name] 已存在" >&2; return 1; }
+			uci -q set "campnet.$name=account"
+			uci -q set "campnet.$name.enabled=1"
+			uci -q commit campnet
+			echo "已新建账号[$name]（还需 campnet secret set <学号> <密码> $name）"
+			;;
+		del)
+			[ -n "$name" ] || { echo "用法: campnet account del <名>" >&2; return 1; }
+			local l
+			for l in $(acct_line_ids "$name"); do
+				uci -q delete "campnet.$l"
+				rm -f "$CAMP_STATE_DIR/$l.state"
+			done
+			uci -q delete "campnet.$name"
+			uci -q commit campnet
+			echo "已删除账号[$name]及其名下线路"
+			;;
+		*) echo "用法: campnet account {list|add|del}" >&2; return 1 ;;
+	esac
+}
+
+_cred_ok2() { secret_read "$1" >/dev/null 2>&1 && echo 1 || echo 0; }
+
 cmd_test() {
-	local acc="${1:-main}" iface dev
 	load_settings
-	secret_read "$acc" && echo "帐密: 已配置" || echo "帐密: 未配置（缺省请运行 campnet secret set）"
-	iface=$(acct_iface "$acc"); dev=$(iface_to_dev "$iface")
-	echo "接口: $iface / $dev"
-	ip=$(dev_ip "$dev")
-	echo "IP  : ${ip:-无}"
-	echo "网关: $S_GATEWAY (模式: $S_AUTH_MODE)"
-	if dev_has_ip "$dev"; then
-		echo "在线探测: $(probe_status "$dev")"
+	local l="${1:-}"
+	[ -n "$l" ] || l=$(camp_line_ids | head -1)
+	[ -n "$l" ] || { echo "尚未配置线路" >&2; return 1; }
+	local acc dev
+	acc=$(line_account "$l")
+	echo "线路  : $l（类型 $(line_type "$l")）"
+	echo "账号  : ${acc:--}"
+	if [ -n "$acc" ]; then
+		secret_read "$acc" && echo "帐密  : 已配置" || echo "帐密  : 未配置"
 	fi
-	echo "日志: $CAMP_LOG"
+	dev=$(line_dev "$l")
+	echo "接口  : $(line_iface "$l") / $dev"
+	echo "IP    : $(dev_ip "$dev")"
+	echo "网关  : $S_GATEWAY (模式 $S_AUTH_MODE)"
+	dev_has_ip "$dev" && echo "探测  : $(probe_status "$dev")"
+	echo "日志  : $CAMP_LOG"
 }
 
 cmd_service() {
 	local act="$1"
 	[ -x /etc/init.d/campnet ] || { echo "缺少 /etc/init.d/campnet" >&2; return 1; }
 	case "$act" in
-		enable|disable|start|stop|restart|reload)
-			/etc/init.d/campnet "$act"
-			;;
-		*) echo "用法: campnet service {enable|disable|start|stop|restart}" >&2; return 1 ;;
+		enable|disable|start|stop|restart|reload) /etc/init.d/campnet "$act" ;;
+		*) echo "用法: campnet {enable|disable|start|stop|restart|reload}" >&2; return 1 ;;
 	esac
 }
 
 case "${1:-}" in
 	auth) shift; cmd_auth "$@" ;;
 	status) shift; cmd_status "$@" ;;
+	portal) shift; cmd_portal "$@" ;;
+	line) shift; cmd_line "$@" ;;
+	account) shift; cmd_account "$@" ;;
 	dial) shift; exec "$(dirname "$0")/dial.sh" "$@" ;;
 	log) shift; cmd_log "$@" ;;
 	secret)
@@ -122,6 +226,9 @@ case "${1:-}" in
 		esac
 		;;
 	test) shift; cmd_test "$@" ;;
+	version) camp_version; echo ;;
+	checkupdate) shift; camp_check_update "$@" ;;
+	migrate) camp_migrate_legacy && echo "迁移检查完成" ;;
 	enable|disable|start|stop|restart|reload) cmd_service "$1" ;;
 	-h|--help|help) usage ;;
 	*) usage >&2; exit 1 ;;

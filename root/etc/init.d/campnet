@@ -1,6 +1,8 @@
 #!/bin/sh /etc/rc.common
 # ============================================================
-# campnet —— 校园网认证 + 多播均衡 服务（procd 每账号一实例）
+# campnet —— 校园网认证 + 多线路多播均衡 服务
+# 每条**线路**一个 procd 实例（不是每个账号）：同一账号可以挂两条线路，
+# 各自是独立会话，必须独立保活。
 # START 95：晚于 network/netifd，先编排多播线路再拉起 keeper
 # ============================================================
 
@@ -9,13 +11,13 @@ STOP=10
 USE_PROCD=1
 
 CAMP_LIB=/usr/libexec/campnet/lib.sh
-CAMP_BIN=/usr/libexec/campnet/campnet
 CAMP_DIAL=/usr/libexec/campnet/dial.sh
 CAMP_KEEPER=/usr/libexec/campnet/keeper.sh
 
 start_service() {
 	. "$CAMP_LIB" 2>/dev/null || { echo "无法加载 $CAMP_LIB" >&2; return 1; }
 	secret_seed
+	camp_migrate_legacy      # v0.x「账号即线路」的配置先升级到新模型
 	load_settings
 
 	if [ "$S_ENABLED" != "1" ]; then
@@ -28,20 +30,27 @@ start_service() {
 		( "$CAMP_DIAL" setup >/dev/null 2>&1 & )
 	fi
 
-	local ids acc san
-	ids=$(camp_account_ids)
-	[ -n "$ids" ] || log WARN "未配置任何账号（uci campnet.account.*）"
-	for acc in $ids; do
-		[ "$(acct_enabled "$acc")" = "1" ] || continue
-		san=$(printf '%s' "$acc" | tr -c 'A-Za-z0-9_' '_')
+	local l acc san n=0
+	for l in $(camp_line_ids); do
+		[ "$(line_enabled "$l")" = "1" ] || continue
+		acc=$(line_account "$l")
+		if [ -z "$acc" ]; then
+			log WARN "线路[$l] 未绑定账号，跳过"
+			continue
+		fi
+		[ "$(acct_enabled "$acc")" = "1" ] || { log INFO "线路[$l] 的账号[$acc] 已停用，跳过"; continue; }
+
+		san=$(printf '%s' "$l" | tr -c 'A-Za-z0-9_' '_')
 		procd_open_instance "keeper_${san}"
-		procd_set_param command /bin/sh "$CAMP_KEEPER" --account "$acc"
+		procd_set_param command /bin/sh "$CAMP_KEEPER" --line "$l"
 		procd_set_param respawn 5 5 60
 		procd_set_param stdout 1
 		procd_set_param stderr 1
 		procd_close_instance
-		log INFO "已启动账号[$acc] 保活实例"
+		n=$((n + 1))
+		log INFO "已启动线路[$l] 保活实例（账号 $acc）"
 	done
+	[ "$n" -gt 0 ] || log WARN "没有可用的线路（检查 uci campnet.line.*）"
 	return 0
 }
 
@@ -56,6 +65,6 @@ reload_service() {
 }
 
 service_triggers() {
-	# uci commit campnet 后自动 reload（settings/账号变更生效）
+	# uci commit campnet 后自动 reload（settings/线路/账号变更生效）
 	procd_add_reload_trigger campnet
 }

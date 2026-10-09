@@ -1,150 +1,169 @@
-# luci-app-campnet — 校园网自动认证 + 多账号多播均衡
+# luci-app-campnet
 
 [![License: WTFPL](https://img.shields.io/badge/License-WTFPL-brightgreen.svg)](LICENSE)
-[![OpenWrt](https://img.shields.io/badge/OpenWrt-Supported-brightgreen.svg)](https://openwrt.org/)
 
-面向 ImmortalWrt / OpenWrt（23.05 系，LuCI2 JS）的校园网 Portal 认证插件：
-**断线自动重连 + 每账号独立 macvlan WAN + mwan3 均衡（多账号带宽倍增）**，
-带原生 LuCI 交互配置界面（非旧式“卡片风”自绘 UI）。
+面向 ImmortalWrt / OpenWrt（LuCI2 JS）的**校园网 Portal 自动认证**插件：
+断线自动重连、多线路多播均衡（带宽叠加）、原生 LuCI 三页交互界面。
 
-- 调研记录：`docs/research-notes.md`　设计方案：`docs/design.md`
-- 后端：POSIX shell（认证 / 保活 / 编排），前端：LuCI2 原生 JS view + form
+> 认证算法在**肇庆学院锐捷 eportal**（网关 `10.0.1.51`）上完成真机实测；
+> `ruijie`（axe_bras / webauth.do）与 `eportal` 两种门户均内置，可自动探测。
+
+---
 
 ## 功能
 
 | 模块 | 说明 |
 |---|---|
-| 自动登录 | 默认认证网关 `10.0.1.51`，支持两种认证系统（可切换/自动探测） |
-| 断线自动重连 | `/etc/init.d/campnet` procd 服务，每账号一个 keeper 实例周期探测，掉线立即重试登录 |
-| 多播均衡（带宽倍增） | 每账号一条独立 `macvlan + DHCP` WAN（独立 MAC 防风控），`mwan3` 负载均衡 |
-| LuCI 交互界面 | 状态总览 / 设置 / 日志 三页，原生组件观感 |
-| 帐密安全 | 帐密存 `/etc/campnet/.config`（0600），**不入 uci、不入 Git**（`.config` 已 `.gitignore`） |
-| 日志 | `/var/log/campnet/campnet.log` 行数轮转 + 敏感字段写入前脱敏 |
-| 增强项 | auto 模式自动探测门户类型、多播一键 setup/teardown（幂等、只动自建资源）、MAC 固化、开机自启、状态缓存 |
+| 自动认证 | `auto` 模式按被劫持页面特征自动识别门户类型（eportal / axe_bras）；认证成功后自动保活 |
+| 断线自动重连 | 每条线路一个 procd keeper，周期探测，掉线即重登（实测检测到恢复约 2 秒） |
+| 多线路均衡 | 每条线路一条独立会话，`mwan3` 负载均衡；多线程下载/测速可叠加带宽 |
+| 账号与线路分离 | **账号**是身份（学号/密码），**线路**是会话；一条线路绑定一个账号，一个账号最多 2 条线路 |
+| 状态总览 | 总状态横幅 + 线路表 + 门户回传的实名信息（姓名/学号/用户组/余额） |
+| 帐密安全 | 存 `/etc/campnet/.config`（0600），**不进 uci、不进 Git** |
+| 版本检查 | 设置页显示版本并可一键比对 GitHub 最新 tag |
+| 日志 | `/var/log/campnet/campnet.log`，行数轮转；写入前对密码/queryString/mac 等脱敏 |
 
-> 带宽倍增边界（与调研一致）：mwan3 为 per-flow 均衡，**多线程/多连接**场景才能叠加带宽；
-> 单线程单连接不会叠加。
+> **带宽叠加的前提**：mwan3 是 per-flow 均衡，只有**多线程/多连接**场景才叠加；
+> 单线程下载不会变快。另外要叠加，各线路的 `mwan3 metric` 必须填同一个值
+> （mwan3 只采用 metric 最小的那批成员，不同值等于只做故障切换）。
 
-## 目录结构（仓库即 LuCI 应用包）
-
-```
-Makefile                      # OpenWrt 包 Makefile（PKG_NAME=luci-app-campnet）
-LICENSE                       # WTFPL 2.0
-.config.example               # 本地运行时配置样例（含默认 学号/密码 与网关）
-.config                       # 本地运行时配置（已被 .gitignore 忽略，勿提交）
-scripts/gen-config.sh         # .config 生成 / 同步为打包默认模板
-docs/{research-notes.md,design.md}
-tests/static-checks.sh        # 交付前静态自检（sh -n / JSON / JS / lib 冒烟）
-root/                         # → 安装到设备根 /
-  etc/config/campnet          #   uci 默认配置（非敏感）
-  etc/campnet/.config.default #   帐密首启模板（默认 202524104131/240414）
-  etc/init.d/campnet          #   procd 服务（每账号一实例）
-  etc/uci-defaults/40_luci-campnet  # 首启：种子 .config + 自启
-  usr/libexec/campnet/        #   后端：campnet(CLI) lib.sh ruijie.sh eportal.sh
-  usr/libexec/rpcd/luci.campnet     #   keeper.sh dial.sh status.sh
-  usr/share/luci/menu.d/、rpcd/acl.d/  # 菜单 / 权限
-htdocs/luci-static/resources/view/campnet/  # LuCI2 JS：overview / settings / log
-```
+---
 
 ## 安装
 
-把仓库目录放入 LuCI feed 或直接放入源码树：
+### 方式一：LuCI feed（推荐）
 
 ```bash
-# 方式一（推荐，LuCI feed 布局）
 ln -s "$PWD" <immortalwrt>/feeds/luci/applications/luci-app-campnet
 ./scripts/feeds update -i && ./scripts/feeds install -a
-make menuconfig   # LuCI → Applications → luci-app-campnet（*）
+make menuconfig      # LuCI → Applications → luci-app-campnet（*）
 make package/luci-app-campnet/compile
-
-# 方式二：放入 <immortalwrt>/package/custom/luci-app-campnet，
-# 并把 Makefile 里 "include ../../luci.mk" 改为
-#   include $(TOPDIR)/feeds/luci/luci.mk
 ```
 
-依赖：`luci-base curl ip-full jsonfilter mwan3`（opkg 自动安装）。
+### 方式二：放进源码树
+
+把本目录放到 `<immortalwrt>/package/custom/luci-app-campnet`，并把 Makefile 里的
+`include ../../luci.mk` 改成 `include $(TOPDIR)/feeds/luci/luci.mk`。
+
+依赖：`luci-base curl ip-full jsonfilter mwan3`（仅多线路均衡需要 mwan3）。
 
 装好后访问 **LuCI → 服务 → 校园网认证 CampNet**。
 
+---
+
 ## 快速上手
 
-1. `服务 → 校园网认证 CampNet → 设置`：核对「认证网关」默认 `10.0.1.51`；
-   若你的校园网不是 axe_bras/webauth.do 系统，把「认证模式」切到 `eportal` 或 `auto`。
-2. 页底「帐密」区：选 `main` 账号，填学号密码，点保存（写入 `/etc/campnet/.config`，0600）。
-3. 回「状态总览」点 **立即登录全部**；keeper 每 `check_interval` 秒自动保活。
-4. 加号带宽倍增：设置页新增账号段（`create_vlan=1`），补帐密 → 总览点
-   **重建多播线路**，或重启服务自动编排。
+1. **插件设置 → 账号**：填账号名（例如 `main`）→ Add。
+2. **插件设置 → 帐密**：在对应账号那一行填学号与密码 → 保存。
+3. **插件设置 → 线路**：默认已有一条 `wan` 线路（复用物理 WAN），把「归属账号」选成刚建的账号。
+4. **状态总览**：点「立即登录全部」。之后 keeper 每 `保活周期` 秒自动保活。
 
-### CLI（SSH 下）
+要**叠加带宽**时：再加一条线路，`类型` 选 `macvlan`（独立设备 + 独立 MAC），
+归属同一个账号，并把两条线路的 `mwan3 metric` 填成同一个值（默认都是 10）。
+
+---
+
+## 界面
+
+### 状态总览
+首屏横幅直接回答"现在通不通网"，下面是线路表（线路 / 归属账号 / 设备 / 状态 / IP / 最近结果 / 登录）。
+再往下是账号的**门户实名信息**（姓名、学号、用户组、余额 —— 由校园网门户回传，需要线路在线）。
+页尾「危险操作」里的撤销线路带二次确认。
+
+### 插件设置
+- **账号**：表格，一行一个账号，显示线路数与帐密状态。
+- **线路**：表格，一行一条线路；类型/MAC/metric/权重等细节在 Edit 弹窗里。
+- **帐密**：每个账号一行，直接填、直接存（不再是先选账号的下拉框）。
+- **基本 / 高级**：常用项在「基本」；锐捷表单字段与超时等 12 个参数收在「高级」里，
+  勾选「展开高级参数」才显示。
+- **版本**：显示当前版本，可检查更新。
+
+### 插件日志
+行数选择、级别过滤（INFO / WARN / ERROR）、自动刷新。
+
+---
+
+## 命令行
 
 ```sh
-campnet status [-j]                     # 状态（JSON）
-campnet auth all --force                # 立即登录全部账号
-campnet auth main                       # 只登录 main
-campnet dial setup|teardown|status      # 多播线路编排/撤销/查看
-campnet secret set <学号> <密码> [账号]  # 写帐密
-campnet secret show [账号]              # 查看是否已配置（脱敏）
-campnet log [行数]                      # 日志
-campnet test [账号]                     # 连通性自检
+campnet status [-j]                      # 状态（-j 输出 JSON）
+campnet auth [all|<线路>] [--force]       # 立即登录
+campnet portal [线路]                     # 查看门户回传的实名信息
+campnet line {list|add|del}              # 线路管理
+campnet account {list|add|del}           # 账号管理
+campnet secret set <学号> <密码> [账号]    # 写帐密
+campnet secret show [账号]                # 查看是否已配置（脱敏）
+campnet test [线路]                       # 连通性自检
+campnet dial {setup|teardown|status}     # 线路编排（建/删 macvlan 与 mwan3）
+campnet log [行数]
+campnet version | checkupdate            # 版本 / 检查更新
 /etc/init.d/campnet {start|stop|restart|enable|disable}
 ```
 
+---
+
 ## 配置参考（uci `campnet`）
 
-- `settings`：`enabled`、`auth_mode`(ruijie|eportal|auto)、`gateway`(默认 10.0.1.51)、
-  `probe_url`、`check_interval`(120s)、`max_retry`/`retry_delay`、`poll_max`/`poll_interval`、
-  `uplink`(auto)、`dial_on_start`、`wlanacname`、`pageid`、`templatetype`、`vlan`、`auth_type`、
-  `auth_host`/`server_ip`（可选域名+IP，--resolve 绕 DNS）、curl 超时。
-- `account`：每账号一段（named），`enabled`、`iface`(uci 接口，默认 wan)、
-  `create_vlan`(1=建独立 macvlan 通道)、`macaddr`(留空自动生成固化)、`metric`、`weight`。
-- 帐密：`/etc/campnet/.config`，`[default]`=main，`[account:<id>]`=附加账号。
+### `settings`
+`enabled`、`auth_mode`(auto|ruijie|eportal)、`gateway`(默认 10.0.1.51)、`probe_url`、
+`check_interval`(60s)、`max_retry`/`retry_delay`、`dial_on_start`、`uplink`(auto)、
+`show_advanced`；高级项：`wlanacname`、`pageid`、`templatetype`、`vlan`、`auth_type`、
+`auth_host`/`server_ip`、`poll_max`/`poll_interval`、curl 超时。
 
-## 认证算法（默认 ruijie / axe_bras）
+### `account`（身份）
+| 选项 | 说明 |
+|---|---|
+| `enabled` | 是否启用该账号 |
 
-移植自本地项目 campus-auth-openwrt（GXSTNU axe_bras/webauth.do 一键登录流程，见 docs/）：
+### `line`（会话）
+| 选项 | 说明 |
+|---|---|
+| `enabled` | 是否启用该线路 |
+| `account` | **必填**，归属账号 |
+| `type` | `wan`=复用已有网络接口；`macvlan`=自建独立设备 |
+| `iface` | `type=wan` 时使用哪个网络接口 |
+| `macaddr` | `type=macvlan` 的设备 MAC，留空自动生成并固化 |
+| `metric` / `weight` | mwan3 成员指标与权重（**要均衡则各线路 metric 必须相同**） |
+| `route_metric` | 默认路由 metric，须大于主 wan 的 0（默认 20） |
+| `ifbase` | 可选，手工指定通道短名（影响设备名 `campnet_<ifbase>`） |
 
-1. Cookie 播种：`GET http://<gateway>/`（若配了 `auth_host` 再播种其 https 根）。
-2. 表单 `POST https://<host>/webauth.do`：`wlanacip/wlanacname/wlanuserip/mac/vlan/scheme/
-   serverIp/hostIp/pageid/templatetype/...`，账号密码 `--data-urlencode`。
-3. 若响应含「正在进行外网拨号/请稍候」→ 轮询 `POST /getAuthResult.do`
-   （`userId + pageId`，poll_max×poll_interval）。
-4. 在线判定：探针 URL 返回 204，或 `ping -I <dev> 223.5.5.5`。
+- **账号数没有上限**，≥2 条线路才会注入 mwan3 均衡。
+- 通道名由线路名派生且总长 ≤13 字节（mwan3 链名上限）；超长时自动取「前 2 位 + 3 位哈希」，
+  撞车会明确报错而不是静默共用。
+- **账号名与线路名共用一个命名空间**（uci section id 全局唯一），不能重名。
 
-`eportal` 模式（kanoverse 调研结论）：从网关被劫持响应提取 `eportal/index.jsp?<queryString>`，
-双 URL 编码后 `POST /eportal/InterFace.do?method=login`（`result:"success"` 判成功）。
+### 帐密
+`/etc/campnet/.config`（0600）：`[default]` = `main` 账号；`[account:<id>]` = 其它账号。
+仓库自带的 `.config.default` 是**空占位**，不含任何真实凭据。
 
-## 多播均衡原理
+---
 
-```
-物理WAN(ethX) ─┬─ wan(main 账号，直连)
-               ├─ campnet_acc2 (macvlan, 独立MAC) ─ DHCP → 账号2
-               ├─ campnet_acc3 (macvlan, 独立MAC) ─ DHCP → 账号3
-               └─ …
-全部接口 → mwan3 member/metric/weight → policy campnet_balanced
-        → rule campnet_rule(0.0.0.0/0)（自动置于 default_rule 之前）
-```
+## 常见问题
 
-- `dial setup` 幂等：只增不改用户已有配置；自建资源登记在 `/etc/campnet/.created`，
-  `dial teardown` 只删登记过的资源。
-- macvlan 由 netifd 托管（`config device` type macvlan + mode bridge），重启自动重建；
-  MAC 生成后写回 uci `macaddr`，重启不漂移。
-- 主账号 `main` 默认 `create_vlan=0`（直连 wan）；要叠加带宽，再加 `create_vlan=1` 的账号段即可。
+**认证一直失败？**
+先看「插件日志」。若是 `auto` 探测出的门户类型不对，到「设置 → 基本」手动指定
+`eportal` 或 `ruijie`；再不行就抓一次门户页面的表单，把字段填进「高级」。
+
+**加了第二条线路，但速度没变？**
+① 单线程下载本来就不会叠加；② 检查两条线路的 `mwan3 metric` 是否相同；
+③ 学校可能限制同一账号的并发会话数（本插件默认每账号最多 2 条线路）。
+
+**线路的 IP 会变？**
+校园网 DHCP 租约较短时 IP 可能变化，会话随之失效，keeper 会在下一个周期自动重登。
+想更快恢复就把「保活周期」调小。
+
+**从旧版本升级后配置会不会丢？**
+不会。首次启动会自动把 v0.x 的「账号即线路」配置迁移成新模型，
+macvlan 设备名与已有的 mwan3 配置都保持不变。
+
+---
 
 ## 安全
 
-- 帐密绝不进 uci / Git：`.config` 已在 `.gitignore`；仓库只含脱敏样例与首启默认模板
-  （`.config.default`，随固件/ipk 携带默认 学号/密码，请按需修改）。
-- 日志对所有请求体做脱敏（passwd/password/userId/queryString/mac/wlanuserip/distoken → `***`）。
-- cookie/锁文件放 `/tmp`；认证所需静态路由只加不改，失败静默。
-
-## 测试与验证（本仓库内可执行）
-
-```sh
-./tests/static-checks.sh     # sh -n / JSON / node --check / lib 纯函数冒烟
-```
-
-真机验证项（固件编译与校园网实网不可在此环境进行，已在 docs/design.md 风险节说明）：
-认证成功率、mwan3 均衡命中顺序、macvlan DHCP、服务 reload 触发链。
+- 帐密只存 `/etc/campnet/.config`（0600），**不写入 uci、不提交进仓库**；
+  仓库里的 `.config.default` 是空占位模板。
+- 日志对所有请求体脱敏（`passwd`/`password`/`userId`/`queryString`/`mac`/`wlanuserip`/`distoken` → `***`）。
+- cookie 文件按**线路**隔离在 `/tmp`。
 
 ## License
 

@@ -22,7 +22,10 @@ COOKIE_PREFIX=/tmp/campnet-cookie
 # ------------------------------------------------------------
 # 基础工具
 # ------------------------------------------------------------
-uciq() { uci -q get "$1" 2>/dev/null; }
+# 末尾的 `|| true` 不能省：调用方常写成 `x=$(uciq ...)`，若 uci 读不到
+# （配置项不存在、或环境里根本没有 uci），命令替换返回非 0；在调用方开了
+# `set -e` 的场景（自测脚本等）会直接把整个函数截断，表现为"静默返回空"。
+uciq() { uci -q get "$1" 2>/dev/null || true; }
 
 # 取整数值并带默认（非法/空 → 默认）
 uciqn() {
@@ -34,17 +37,23 @@ uciqn() {
 	esac
 }
 
-# 日志：写文件（行数轮转）+ 标准错误
+# 日志：写文件（行数轮转）+ 诊断输出
+# 诊断必须走 **stderr**：本文件里多处形如 `mac=$(_acct_mac "$acc")` 的命令替换，
+# 若 log() 写 stdout，被替换函数内部的提示会被一并捕获进变量值，污染返回值
+# （实测会把 "[WARN] ... " 拼进 MAC）。stdout 只留给真正的数据。
 log() {
 	local lvl="$1" msg="$2" ts
-	mkdir -p "$CAMP_LOG_DIR" 2>/dev/null
+	# 每步都要兜住失败：log 绝不能返回非 0，否则在调用方开了 `set -e`
+	# 的场景（如自测脚本）会把调用方整个干掉。
+	mkdir -p "$CAMP_LOG_DIR" 2>/dev/null || true
 	if [ -f "$CAMP_LOG" ] && [ "$(wc -l < "$CAMP_LOG" 2>/dev/null || echo 0)" -gt "$MAX_LOG_LINES" ]; then
 		tail -n "$TRIM_LOG_LINES" "$CAMP_LOG" > "$CAMP_LOG.tmp" 2>/dev/null \
 			&& mv "$CAMP_LOG.tmp" "$CAMP_LOG" 2>/dev/null
 	fi
 	ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
-	printf '[%s] [%s] %s\n' "$ts" "$lvl" "$msg" >> "$CAMP_LOG" 2>/dev/null
-	printf '[%s] %s\n' "$lvl" "$msg"
+	printf '[%s] [%s] %s\n' "$ts" "$lvl" "$msg" >> "$CAMP_LOG" 2>/dev/null || true
+	printf '[%s] %s\n' "$lvl" "$msg" >&2
+	return 0
 }
 
 # 日志脱敏：避免把 帐号/密码/queryString/mac/distoken/wlanuserip 打进日志
@@ -81,10 +90,10 @@ urlencode() {
 # ------------------------------------------------------------
 load_settings() {
 	S_ENABLED=$(uciqn campnet.settings.enabled 1)
-	S_AUTH_MODE=$(uciq campnet.settings.auth_mode);          S_AUTH_MODE=${S_AUTH_MODE:-ruijie}
+	S_AUTH_MODE=$(uciq campnet.settings.auth_mode);          S_AUTH_MODE=${S_AUTH_MODE:-auto}
 	S_GATEWAY=$(uciq campnet.settings.gateway);              S_GATEWAY=${S_GATEWAY:-10.0.1.51}
 	S_PROBE_URL=$(uciq campnet.settings.probe_url);          S_PROBE_URL=${S_PROBE_URL:-http://connect.rom.miui.com/generate_204}
-	S_CHECK_INTERVAL=$(uciqn campnet.settings.check_interval 120)
+	S_CHECK_INTERVAL=$(uciqn campnet.settings.check_interval 60)
 	S_MAX_RETRY=$(uciqn campnet.settings.max_retry 3)
 	S_RETRY_DELAY=$(uciqn campnet.settings.retry_delay 5)
 	S_POLL_MAX=$(uciqn campnet.settings.poll_max 20)
@@ -106,45 +115,149 @@ load_settings() {
 }
 
 # ------------------------------------------------------------
-# 账号（uci campnet.account.*，named 优先，兼容匿名 @account[N]）
+# 账号（身份）与线路（会话）
+#
+# 模型：account 只描述「身份」（凭据 + 是否启用）；line 才是实体，
+# 一条 line = 一条独立认证会话 = 一个 procd keeper 实例 = 一份状态文件。
+# line 必须绑定一个 account，且同一 account 名下线路总数有上限
+# （LINE_PER_ACCOUNT_MAX，校园网对同账号并发会话有限制）。
 # ------------------------------------------------------------
-camp_account_ids() {
-	uci show campnet 2>/dev/null | grep -E '^campnet\.[^=]+=account$' \
-		| sed -E 's/^campnet\.//; s/=account$//'
+LINE_PER_ACCOUNT_MAX=2
+
+_uci_sections() { # <类型>
+	uci show campnet 2>/dev/null | grep -E "^campnet\.[^=]+=$1$" \
+		| sed -E 's/^campnet\.//; s/='"$1"'$//'
 }
 
-acct_opt() { uciq "campnet.$1.$2"; }
+camp_account_ids() { _uci_sections account; }
+camp_line_ids()    { _uci_sections line; }
+
+acct_opt()     { uciq "campnet.$1.$2"; }
 acct_enabled() { uciqn "campnet.$1.enabled" 1; }
+acct_exists()  { [ -n "$(uciq "campnet.$1")" ]; }
 
-# 该账号实际绑定的 uci network 接口名（默认 wan）
-acct_iface() {
-	local v
-	v=$(acct_opt "$1" iface)
-	echo "${v:-wan}"
+line_opt()     { uciq "campnet.$1.$2"; }
+line_enabled() { uciqn "campnet.$1.enabled" 1; }
+line_account() { line_opt "$1" account; }
+# 线路类型：wan=复用已有网络接口；macvlan=自建独立设备
+line_type() {
+	local t
+	t=$(line_opt "$1" type)
+	echo "${t:-macvlan}"
 }
+
+# 线路生效的 uci network 接口名
+line_iface() {
+	case "$(line_type "$1")" in
+		wan|physical|'') line_opt "$1" iface | { read -r v; echo "${v:-wan}"; } ;;
+		*) dev_name_for "$1" ;;
+	esac
+}
+
+# 线路绑定的内核设备名
+line_dev() { iface_to_dev "$(line_iface "$1")"; }
+
+# 某账号名下的线路（含未启用的）
+acct_line_ids() {
+	local l
+	for l in $(camp_line_ids); do
+		[ "$(line_account "$l")" = "$1" ] && echo "$l"
+	done
+}
+acct_line_count() { acct_line_ids "$1" | grep -c . ; }
 
 # 多播命名助手（与 dial.sh 共用；确定性）
-# 账号 id → 短基名（<=7 字节，仅字母数字）
+#
+# 长度预算被 mwan3 卡死，不能随意放大：
+#   * iptables/nft 链名上限 28 字符；mwan3 为每个接口建 `mwan3_iface_in_<iface>`
+#     （前缀 15）→ 接口名必须 <=13 字符；
+#   * mwan3 策略名上限 15 字符（`mwan3_policy_<name>` 同理受限）。
+# 因此接口名 = "campnet_"(8) + 基名 <=13 → 基名只能 5 位。
+# 超出不会报错，只会让 mwan3 静默丢弃策略/接口，均衡完全不生效（实测踩过）。
+#
+# **不能简单截断**：截前 5 位会让 202524104130 与 202524104131 都变成
+# campnet_20252 —— 两个账号共用同一条线路，第二个静默失效。
+# 所以超过 5 位时改用「前 2 位 + 3 位哈希」（4096 桶，稳定且区分度够）。
+# 首次 dial 会把结果固化进 uci campnet.<id>.ifbase，之后 dial/keeper/status
+# 都读它，保证三处看到同一个名字。
 base_of() {
-	local base
-	base=$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]//g' | cut -c1-7)
-	[ -n "$base" ] || base=acc
-	echo "$base"
+	local id stored h
+	id=$(printf '%s' "$1" | sed 's/[^A-Za-z0-9]//g')
+	[ -n "$id" ] || id=acc
+
+	stored=$(uciq "campnet.$1.ifbase" 2>/dev/null)
+	case "$stored" in
+		''|*[!A-Za-z0-9]*) ;;
+		*) [ "${#stored}" -le 5 ] && { printf '%s' "$stored"; return; } ;;
+	esac
+
+	if [ "${#id}" -le 5 ]; then
+		printf '%s' "$id"
+		return
+	fi
+
+	h=$(printf '%s' "$id" | awk '{
+		h = 0
+		for (i = 1; i <= length($0); i++)
+			h = (h * 131 + index("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ", toupper(substr($0, i, 1)))) % 4096
+		printf "%03x", h
+	}' 2>/dev/null || true)
+	[ -n "$h" ] || h=000
+	printf '%s%s' "$(printf '%s' "$id" | cut -c1-2)" "$h"
 }
-# 内核设备名 / uci network 接口 id（<=15 字节）
+# 内核设备名 / uci network 接口 id（<=13 字节，见上）
 dev_name_for() { echo "campnet_$(base_of "$1")"; }
 # netifd device 段 id（与接口段区分）
 devsec_for() { echo "campd_$(base_of "$1")"; }
 
-# 该账号实际生效的 uci network 接口：
-# create_vlan=1 → 专属 macvlan 通道 campnet_<base>；否则账号 iface（默认 wan）
-acct_iface_effective() {
-	local acc="$1"
-	if [ "$(uciqn "campnet.$acc.create_vlan" 0)" = "1" ]; then
-		dev_name_for "$acc"
-	else
-		acct_iface "$acc"
-	fi
+# ------------------------------------------------------------
+# 旧模型一次性迁移
+#
+# v0.x：account 段里带 create_vlan/iface/macaddr/metric/weight —— 一个账号就是一条线路。
+# v1.x：account 只管身份，线路搬到独立的 line 段。这里做 1:1 转换，
+#       线路名沿用账号名，因此 macvlan 设备名（campnet_<base>）与
+#       uci 里的 ifbase 键（campnet.<id>.ifbase）都不变，认证不受影响。
+# ------------------------------------------------------------
+camp_migrate_legacy() {
+	local acc l old=0 ob
+
+	[ -n "$(camp_line_ids)" ] && return 0     # 已有 line 段 → 迁移过了
+	for acc in $(camp_account_ids); do
+		[ -n "$(acct_opt "$acc" create_vlan)" ] && old=1
+	done
+	[ "$old" = "1" ] || return 0
+
+	for acc in $(camp_account_ids); do
+		# 线路名必须与账号名不同！uci 的 section id 是全局唯一的，
+		# 直接用账号名当线路名会把账号段**整个覆盖掉**（实测踩过）。
+		l="line_$acc"
+		uci -q set "campnet.$l=line"
+		uci -q set "campnet.$l.enabled=$(acct_enabled "$acc")"
+		uci -q set "campnet.$l.account=$acc"
+		uci -q set "campnet.$l.iface=$(acct_opt "$acc" iface)"
+		if [ "$(uciqn "campnet.$acc.create_vlan" 0)" = "1" ]; then
+			uci -q set "campnet.$l.type=macvlan"
+			uci -q set "campnet.$l.macaddr=$(acct_opt "$acc" macaddr)"
+			uci -q set "campnet.$l.metric=$(uciqn "campnet.$acc.metric" 10)"
+			uci -q set "campnet.$l.weight=$(uciqn "campnet.$acc.weight" 10)"
+			uci -q set "campnet.$l.route_metric=$(uciqn "campnet.$acc.route_metric" 20)"
+			# 把旧的通道短名搬到线路段上，这样 macvlan 设备名（campnet_<base>）
+			# 与 mwan3 里已有的接口名都不变，认证与均衡不受影响。
+			ob=$(acct_opt "$acc" ifbase)
+			[ -n "$ob" ] || ob=$(base_of "$acc")
+			[ -n "$ob" ] && uci -q set "campnet.$l.ifbase=$ob"
+		else
+			uci -q set "campnet.$l.type=wan"
+		fi
+		# 账号段只剩「身份」：清掉线路属性（enabled 保留）
+		for o in create_vlan iface macaddr metric weight route_metric ifbase; do
+			uci -q delete "campnet.$acc.$o" 2>/dev/null
+		done
+		log INFO "campnet: 账号[$acc] 的线路已迁移为 [$l]"
+	done
+	uci -q commit campnet 2>/dev/null
+	log INFO "campnet: 旧配置迁移完成（账号与线路已解耦）"
+	return 0
 }
 
 # uci network 接口 → 内核设备名（23.05 device / 旧 ifname 兼容）
@@ -209,17 +322,22 @@ secret_write() {
 		printf '# [default] = 主账号(main)；[account:<id>] = 附加账号\n'
 		if [ "$want" = "default" ]; then
 			printf '\n[default]\nusername=%s\npassword=%s\n' "$user" "$pass"
-			# 保留其它 [account:*] 分节
-			[ -f "$CAMP_SECRET" ] && awk '
-				BEGIN { skip=0; started=0 }
-				/^[[:space:]]*\[/ {
-					sec=$0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec)
-					if (sec=="default") { skip=1; next }
-					skip=0
-					if (started) print ""; started=1
-				}
-				skip==0 && !/^[[:space:]]*#/ && !/^[[:space:]]*$/ { print }
-			' "$CAMP_SECRET"
+			# 保留其它 [account:*] 分节。
+			# 必须写成 if/fi —— 若写作 `[ -f x ] && awk ...`，在文件尚不存在
+			# （首次配置）时该复合命令返回 1，整个 `{...} > file` 组随之返回 1，
+			# 触发下面的 `|| return 1`，导致「首次保存 main 帐密必然失败」。
+			if [ -f "$CAMP_SECRET" ]; then
+				awk '
+					BEGIN { skip=0; started=0 }
+					/^[[:space:]]*\[/ {
+						sec=$0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec)
+						if (sec=="default") { skip=1; next }
+						skip=0
+						if (started) print ""; started=1
+					}
+					skip==0 && !/^[[:space:]]*#/ && !/^[[:space:]]*$/ { print }
+				' "$CAMP_SECRET"
+			fi
 		else
 			# 保留旧文件（跳过目标分节与注释；[default] 一并保留）
 			if [ -f "$CAMP_SECRET" ]; then
@@ -252,10 +370,12 @@ secret_seed() {
 	if [ -f "$CAMP_SECRET_DEFAULT" ]; then
 		cp "$CAMP_SECRET_DEFAULT" "$CAMP_SECRET" 2>/dev/null || return 1
 	else
+		# 内置兜底同样不带真实凭据：种子出来的是空模板，
+		# secret_read 会因 username/password 为空而判定「未配置」。
 		cat > "$CAMP_SECRET" <<-EOF
 			[default]
-			username=202524104131
-			password=240414
+			username=
+			password=
 		EOF
 	fi
 	chmod 600 "$CAMP_SECRET" 2>/dev/null
@@ -299,11 +419,15 @@ probe_online() {
 }
 
 # probe_status <dev> → stdout: no_ip|authenticated|need_auth|offline
+# 注意：必须先用普通命令取回码再判断。写成 `if probe_online; then ...; fi`
+# 后在 fi 之后取 $? 恒为 0（POSIX: if 无 else 分支且条件为假时返回 0），
+# 会把 need_auth 误判成 offline。
 probe_status() {
 	local dev="$1" rc
 	dev_has_ip "$dev" || { echo no_ip; return; }
-	if probe_online "$dev"; then echo authenticated; return; fi
+	probe_online "$dev"
 	rc=$?
+	[ "$rc" -eq 0 ] && { echo authenticated; return; }
 	[ "$rc" -eq 1 ] && { echo need_auth; return; }
 	echo offline
 }
@@ -368,48 +492,61 @@ sanitize_msg() { printf '%s' "$1" | tr '\n\r' '  ' | cut -c1-200; }
 
 # ------------------------------------------------------------
 # 认证入口 run_login（由 keeper/CLI 调用；需已 source ruijie.sh/eportal.sh）
+# 参数是**线路**（不是账号）：一条线路 = 一次独立认证会话。
+# 路线 → 账号（取凭据）由 line_account() 解析。
 # 返回：0=成功在线 1=失败 2=接口未就绪 3=锁占用
 # ------------------------------------------------------------
 run_login() {
-	local acc="$1" force="$2" iface dev rc mode tried ok
+	local line="$1" force="$2" acc iface dev tried ok
 	load_settings
-	[ "$S_ENABLED" = "1" ] || { log WARN "插件已停用(enabled=0)，跳过 $acc"; return 0; }
-	[ "$(acct_enabled "$acc")" = "1" ] || { log INFO "账号 $acc 未启用，跳过"; return 0; }
+	[ "$S_ENABLED" = "1" ] || { log WARN "插件已停用(enabled=0)，跳过线路[$line]"; return 0; }
+	[ "$(line_enabled "$line")" = "1" ] || { log INFO "线路[$line] 未启用，跳过"; return 0; }
 
-	iface=$(acct_iface_effective "$acc")
+	acc=$(line_account "$line")
+	if [ -z "$acc" ]; then
+		state_write "$line" status error msg "线路未绑定账号"
+		log ERROR "线路[$line] 未绑定账号，请在设置页指定"
+		return 1
+	fi
+	[ "$(acct_enabled "$acc")" = "1" ] || { log INFO "线路[$line] 的账号[$acc] 已停用，跳过"; return 0; }
+
+	iface=$(line_iface "$line")
 	dev=$(iface_to_dev "$iface")
-	ACCOUNT="$acc"; DEV="$dev"
+	ACCOUNT="$acc"; LINE="$line"; DEV="$dev"
 
 	# 已在线且非强制 → 直接成功
 	[ "$force" = "--force" ] || {
 		if probe_status "$dev" | grep -q authenticated; then
-			state_write "$acc" status authenticated ip "$(dev_ip "$dev")" mac "$(dev_mac "$dev")" dev "$dev" msg "已在线"
+			state_write "$line" status authenticated ip "$(dev_ip "$dev")" mac "$(dev_mac "$dev")" \
+				dev "$dev" account "$acc" msg "已在线"
 			return 0
 		fi
 	}
 
 	secret_read "$acc" || {
-		state_write "$acc" status error ip "$(dev_ip "$dev")" dev "$dev" msg "缺少帐密配置(/etc/campnet/.config)"
-		log ERROR "账号[$acc] 缺少帐密，请先配置"
+		state_write "$line" status error ip "$(dev_ip "$dev")" dev "$dev" account "$acc" \
+			msg "账号[$acc] 缺少帐密"
+		log ERROR "线路[$line]（账号[$acc]）缺少帐密，请先在设置页配置"
 		return 1
 	}
 
 	if ! dev_has_ip "$dev"; then
-		state_write "$acc" status no_ip dev "$dev" msg "接口 $iface($dev) 暂无 IPv4"
-		log WARN "账号[$acc] 接口 $dev 无 IP，等待 DHCP"
+		state_write "$line" status no_ip dev "$dev" account "$acc" msg "接口 $iface($dev) 暂无 IPv4"
+		log WARN "线路[$line] 接口 $dev 无 IP，等待 DHCP"
 		return 2
 	fi
 
-	lock_get "login-$acc" || {
-		log WARN "账号[$acc] 已有认证在进行，跳过"
+	lock_get "login-$line" || {
+		log WARN "线路[$line] 已有认证在进行，跳过"
 		return 3
 	}
 
-	state_write "$acc" status authing ip "$(dev_ip "$dev")" mac "$(dev_mac "$dev")" dev "$dev" msg "认证中..."
+	state_write "$line" status authing ip "$(dev_ip "$dev")" mac "$(dev_mac "$dev")" \
+		dev "$dev" account "$acc" msg "认证中…"
 	tried=0; ok=0
 	while [ "$tried" -lt "$S_MAX_RETRY" ]; do
 		tried=$((tried + 1))
-		[ "$tried" -gt 1 ] && log INFO "账号[$acc] 第 $tried 次尝试"
+		[ "$tried" -gt 1 ] && log INFO "线路[$line] 第 $tried 次尝试"
 		case "$S_AUTH_MODE" in
 			eportal) auth_eportal && ok=1 ;;
 			auto)
@@ -426,28 +563,126 @@ run_login() {
 		[ "$tried" -lt "$S_MAX_RETRY" ] && sleep "$S_RETRY_DELAY"
 	done
 
-	lock_release "login-$acc"
+	lock_release "login-$line"
 
 	if [ "$ok" -eq 1 ]; then
-		state_write "$acc" status authenticated ip "$(dev_ip "$dev")" mac "$(dev_mac "$dev")" dev "$dev" \
-			msg "登录成功(第${tried}次)"
-		log INFO "账号[$acc] 校园网认证成功 (接口 $iface/$dev)"
+		state_write "$line" status authenticated ip "$(dev_ip "$dev")" mac "$(dev_mac "$dev")" \
+			dev "$dev" account "$acc" msg "登录成功（第 ${tried} 次）"
+		log INFO "线路[$line]（账号[$acc]）认证成功 (接口 $iface/$dev)"
 		return 0
 	fi
-	state_write "$acc" status error ip "$(dev_ip "$dev")" mac "$(dev_mac "$dev")" dev "$dev" \
-		msg "认证失败(重试${S_MAX_RETRY}次)"
-	log ERROR "账号[$acc] 认证失败（接口 $dev）"
+	state_write "$line" status error ip "$(dev_ip "$dev")" mac "$(dev_mac "$dev")" \
+		dev "$dev" account "$acc" msg "认证失败（重试 ${S_MAX_RETRY} 次）"
+	log ERROR "线路[$line]（账号[$acc]）认证失败（接口 $dev）"
 	return 1
 }
 
+# ------------------------------------------------------------
+# 门户劫持抓取
+# ------------------------------------------------------------
+# 未认证时，门户（NAS）会把对外部的**明文 HTTP** 请求替换成一段跳转脚本
+# （形如 top.self.location.href='http://<gw>/eportal/index.jsp?<queryString>'），
+# 或被 302 到门户页。这个被劫持的响应才是 queryString / 门户类型的唯一可靠来源。
+#
+# 反例（实测肇庆学院 Ruijie eportal）：直接 GET http://<gw>/ 只会 302 到
+# /eportal/redirectortosuccess.jsp，正文为空——**拿不到任何 queryString**，
+# 所以不能只探网关根。
+#
+# 输出：被劫持后的完整响应（含响应头，便于匹配 Location）。无劫持时输出原始正文。
+CAMP_HIJACK_URL="http://connect.rom.miui.com/generate_204"
+
+harvest_portal_response() {
+	local dev="$1" url body
+	url="$S_PROBE_URL"
+	case "$url" in
+		http://*) ;;
+		*) url="$CAMP_HIJACK_URL" ;;   # 探针若是 https 则不会被劫持，改用明文探针
+	esac
+	body=$(curl -si -m 8 --interface "$dev" --noproxy '*' "$url" 2>/dev/null)
+	case "$body" in
+		*eportal/index.jsp*|*webauth.do*|*InterFace.do*) printf '%s' "$body"; return 0 ;;
+	esac
+	# 探针可能已被放行（如校内地址）：再试一个公认的校外明文探针
+	[ "$url" = "$CAMP_HIJACK_URL" ] || body=$(curl -si -m 8 --interface "$dev" \
+		--noproxy '*' "$CAMP_HIJACK_URL" 2>/dev/null)
+	printf '%s' "$body"
+}
+
 # 页面特征探测（auto 模式）：输出 eportal|ruijie
+#
+# 顺序要紧：先认 ruijie 的独有特征（webauth.do/distoken），再认 eportal。
+# 反过来会被 eportal 的通用字样误伤。
+# 另外判据不能只盯着 eportal/index.jsp —— 接口**已在线**时门户不再劫持，
+# 只剩网关根那条 302（本网是 /eportal/redirectortosuccess.jsp）。以前这里
+# 匹配不到就默认 ruijie，于是对 eportal 门户发了一串 axe 的 webauth.do 请求：
+# 无效认证请求在校园网里可能直接触发账号锁定。
 detect_portal_type() {
-	local dev="$1" body hdr
-	body=$(curl -s -m 8 --interface "$dev" --noproxy '*' "http://$S_GATEWAY/" 2>/dev/null)
-	hdr=$(curl -s -o /dev/null -D - -m 8 --interface "$dev" --noproxy '*' "http://$S_GATEWAY/" 2>/dev/null)
-	{
-		printf '%s\n%s\n' "$body" "$hdr"
-	} | grep -qi 'eportal\|InterFace\.do' && { echo eportal; return; }
-	printf '%s\n%s\n' "$body" "$hdr" | grep -qi 'webauth\.do\|axe_bras\|/eportal/' && { echo ruijie; return; }
+	local dev="$1" body
+	# 1) 权威判据：被劫持的跳转脚本
+	body=$(harvest_portal_response "$dev")
+	case "$body" in
+		*webauth.do*|*distoken=*) echo ruijie;  return ;;
+		*eportal*|*InterFace.do*) echo eportal; return ;;
+	esac
+	# 2) 兜底：网关根的响应头/正文（含 302 Location）
+	body=$(curl -si -m 8 --interface "$dev" --noproxy '*' "http://$S_GATEWAY/" 2>/dev/null)
+	case "$body" in
+		*webauth.do*|*distoken=*) echo ruijie;  return ;;
+		*eportal*|*InterFace.do*) echo eportal; return ;;
+	esac
 	echo ruijie
+}
+
+# ------------------------------------------------------------
+# 版本与更新检查
+# ------------------------------------------------------------
+CAMP_VERSION_FILE=/usr/libexec/campnet/VERSION
+CAMP_REPO=RyanZhangK/luci-app-campnet
+CAMP_UPDATE_CACHE=/var/run/campnet/update.json
+
+camp_version() {
+	local v
+	v=$(cat "$CAMP_VERSION_FILE" 2>/dev/null | tr -d ' \n\r')
+	printf '%s' "${v:-unknown}"
+}
+
+# camp_check_update [--refresh] —— 输出 settings/version 页要的 JSON
+# 结果缓存 1 小时：GitHub API 有速率限制，不能每次开页面都打。
+# 取不到最新版本（无网/被墙/仓库无 tag）时不报错，返回 latest="" 由 UI 降级展示。
+camp_check_update() {
+	local force="$1" age cur latest cmp
+
+	cur=$(camp_version)
+	if [ "$force" != "--refresh" ] && [ -f "$CAMP_UPDATE_CACHE" ]; then
+		age=$(( $(date +%s) - $(stat -c %Y "$CAMP_UPDATE_CACHE" 2>/dev/null || echo 0) ))
+		if [ "$age" -ge 0 ] && [ "$age" -lt 3600 ]; then
+			cat "$CAMP_UPDATE_CACHE"
+			return 0
+		fi
+	fi
+
+	latest=$(curl -s -m 8 --noproxy '*' -H 'User-Agent: luci-app-campnet' \
+		"https://api.github.com/repos/$CAMP_REPO/tags" 2>/dev/null \
+		| grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
+		| sed 's/.*:[[:space:]]*"\(.*\)"$/\1/' \
+		| sed 's/^[vV]//' \
+		| sort -t. -k1,1n -k2,2n -k3,3n 2>/dev/null | tail -1)
+
+	# 有更新：latest 与当前不同，且 latest 排序更大（不比字符串，避免 1.10 < 1.9 的坑）
+	[ -n "$latest" ] && [ "$latest" != "$cur" ] || latest=""
+
+	mkdir -p "$(dirname "$CAMP_UPDATE_CACHE")" 2>/dev/null
+	if [ -f /usr/share/libubox/jshn.sh ]; then
+		( . /usr/share/libubox/jshn.sh
+		  json_init
+		  json_add_string version "$cur"
+		  json_add_string latest "$latest"
+		  json_add_string url "https://github.com/$CAMP_REPO"
+		  json_dump ) | tee "$CAMP_UPDATE_CACHE" 2>/dev/null \
+			|| printf '{"version":"%s","latest":"%s","url":"https://github.com/%s"}\n' \
+				"$cur" "$latest" "$CAMP_REPO"
+	else
+		printf '{"version":"%s","latest":"%s","url":"https://github.com/%s"}\n' \
+			"$cur" "$latest" "$CAMP_REPO" | tee "$CAMP_UPDATE_CACHE"
+	fi
 }

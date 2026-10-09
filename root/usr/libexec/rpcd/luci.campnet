@@ -13,6 +13,35 @@
 CAMP=/usr/libexec/campnet/campnet
 CAMP_LOG=/var/log/campnet/campnet.log
 
+# 非标量参数检测。
+#
+# LuCI 的 rpc.declare 有两种 params 写法，调用方式不同（见 luci 的 rpc.js declare()）：
+#   params: ['x']       → 位置传参 fn(v)
+#   params: { x:'str' } → 对象传参 fn({x:v})
+# 数组写法却按对象调用时，服务端收到的是嵌套对象。**坑在于它不会报错**：
+# jshn 对 object/array 不返回内容，而是返回它自己的类型标记（J_T1=对象、J_A1=数组），
+# 于是 tail -n "J_T1" 得到空日志、campnet auth J_T1 找不到线路、帐密被写成一堆 J_T1。
+# 症状是「什么都没报，但功能全不生效」。这里显式检出这种参数并回一个可读原因。
+#
+# 必须在 json_cleanup 之前调用；输出有问题的字段名（正常则无输出）。
+_bad_param() { # <字段>...
+	local f t
+	for f in "$@"; do
+		json_get_type t "$f" 2>/dev/null || continue
+		case "$t" in
+			object|array) printf '%s' "$f"; return 0 ;;
+		esac
+	done
+	return 0
+}
+
+fail_json() { # <msg>
+	json_init
+	json_add_boolean ok 0
+	json_add_string msg "$1"
+	json_dump
+}
+
 # 执行 CLI 并返回 {ok, msg}
 run_cli() {
 	json_init
@@ -26,6 +55,21 @@ run_cli() {
 	json_dump
 }
 
+# 取一个标量参数（含类型校验），结果写入全局 ARG_VAL。
+# 失败时**直接**输出错误 JSON 并返回 1 —— 不能用 $( ) 捕获，
+# 否则错误 JSON 会被命令替换吞掉，前端只看到空响应。
+get_arg() { # <字段> <默认值>
+	local f="$1" def="$2" bad v
+	bad=$(_bad_param "$f")
+	json_get_var v "$f"
+	if [ -n "$bad" ]; then
+		fail_json "参数 $bad 类型非法：请检查前端 rpc 调用是否写成了对象形式"
+		return 1
+	fi
+	ARG_VAL="${v:-$def}"
+	return 0
+}
+
 case "$1" in
 	list)
 		json_init
@@ -35,19 +79,25 @@ case "$1" in
 			json_add_string "lines" "string"
 		json_close_object
 		json_add_object "auth"
-			json_add_string "account" "string"
+			json_add_string "line" "string"
 		json_close_object
 		json_add_object "test"
-			json_add_string "account" "string"
+			json_add_string "line" "string"
+		json_close_object
+		json_add_object "portal"
+			json_add_string "line" "string"
 		json_close_object
 		json_add_object "setSecret"
 			json_add_string "account" "string"
 			json_add_string "username" "string"
 			json_add_string "password" "string"
 		json_close_object
-		json_add_object "dialSetup"
+		json_add_object "lineApply"
 		json_close_object
-		json_add_object "dialTeardown"
+		json_add_object "lineTeardown"
+		json_close_object
+		json_add_object "checkUpdate"
+			json_add_string "refresh" "string"
 		json_close_object
 		json_add_object "setService"
 			json_add_string "action" "string"
@@ -62,66 +112,86 @@ case "$1" in
 				;;
 			getLog)
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
+				bad=$(_bad_param lines)
 				json_get_var lines lines; json_cleanup 2>/dev/null
-				lines=${lines:-120}
+				# 非数字就退回默认行数：坏值直接塞给 tail 会得到空输出，
+				# 前端把「读取失败」显示成「暂无日志」，问题就此隐身。
+				case "$lines" in ''|*[!0-9]*) lines=120 ;; esac
 				json_init
 				json_add_string "log" "$(tail -n "$lines" "$CAMP_LOG" 2>/dev/null)"
+				[ -n "$bad" ] && json_add_string "warn" "参数 $bad 类型非法，已回退默认行数"
 				json_dump
 				;;
 			auth)
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
-				json_get_var account account; json_cleanup 2>/dev/null
-				[ -n "$account" ] || account=all
-				run_cli "$CAMP" auth "$account" --force
+				get_arg line all || exit 0
+				line="$ARG_VAL"
+				json_cleanup 2>/dev/null
+				run_cli "$CAMP" auth "$line" --force
 				;;
 			test)
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
-				json_get_var account account; json_cleanup 2>/dev/null
-				[ -n "$account" ] || account=main
-				run_cli "$CAMP" test "$account"
+				get_arg line "" || exit 0
+				line="$ARG_VAL"
+				json_cleanup 2>/dev/null
+				run_cli "$CAMP" test "$line"
+				;;
+			portal)
+				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
+				get_arg line "" || exit 0
+				line="$ARG_VAL"
+				json_cleanup 2>/dev/null
+				out=$("$CAMP" portal "$line" 2>/dev/null)
+				json_init
+				json_add_boolean ok "$([ -n "$out" ] && echo 1 || echo 0)"
+				json_add_string text "$out"
+				json_dump
 				;;
 			setSecret)
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
+				bad=$(_bad_param account username password)
 				json_get_var account account
 				json_get_var username username
 				json_get_var password password
 				json_cleanup 2>/dev/null
+				[ -n "$bad" ] && { fail_json "参数 $bad 类型非法：请检查前端 rpc 调用是否写成了对象形式"; exit 0; }
 				[ -n "$account" ] || account=main
 				if [ -n "$username" ] && [ -n "$password" ]; then
 					run_cli "$CAMP" secret set "$username" "$password" "$account"
 				else
-					json_init
-					json_add_boolean ok 0
-					json_add_string msg "username/password 不能为空"
-					json_dump
+					fail_json "用户名与密码都不能为空"
 				fi
 				;;
-			dialSetup)
+			lineApply)
 				run_cli "$CAMP" dial setup
 				;;
-			dialTeardown)
+			lineTeardown)
 				run_cli "$CAMP" dial teardown
+				;;
+			checkUpdate)
+				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
+				get_arg refresh "" || exit 0
+				refresh="$ARG_VAL"
+				json_cleanup 2>/dev/null
+				# shellcheck disable=SC2086
+				"$CAMP" checkupdate $refresh 2>/dev/null
 				;;
 			setService)
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
-				json_get_var action action; json_cleanup 2>/dev/null
+				get_arg action "" || exit 0
+				action="$ARG_VAL"
+				json_cleanup 2>/dev/null
 				case "$action" in
 					enable|disable|start|stop|restart) run_cli /etc/init.d/campnet "$action" ;;
-					*) json_init; json_add_boolean ok 0; json_add_string msg "bad action"; json_dump ;;
+					*) fail_json "bad action" ;;
 				esac
 				;;
 			*)
-				json_init
-				json_add_boolean ok 0
-				json_add_string msg "unknown method"
-				json_dump
+				fail_json "unknown method"
 				;;
 		esac
 		;;
 	*)
-		json_init
-		json_add_boolean ok 0
-		json_add_string msg "usage: luci.campnet {list|call <method>}"
-		json_dump
+		fail_json "usage: luci.campnet {list|call <method>}"
 		;;
 esac

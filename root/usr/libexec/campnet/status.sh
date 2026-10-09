@@ -1,39 +1,55 @@
 #!/bin/sh
 # ============================================================
 # status.sh —— 状态输出（被 campnet status 调用；JSON 依赖 jshn）
+# 以**线路**为输出单位：一条线路可能是一个账号的一次会话。
 # ============================================================
+
+CAMP_VERSION_FILE=/usr/libexec/campnet/VERSION
+
+camp_version() {
+	local v
+	v=$(cat "$CAMP_VERSION_FILE" 2>/dev/null | tr -d ' \n\r')
+	echo "${v:-unknown}"
+}
 
 # 服务存活：keeper 进程数
 _service_keepers() {
 	pgrep -f '/usr/libexec/campnet/keeper.sh' 2>/dev/null | wc -l
 }
 
-# 读取账号状态（state 文件缓存；避免状态页触发实时探测造成延迟）
-_account_state() {
-	local acc="$1" key="$2"
-	state_read "$acc" "$key" | grep -q . && state_read "$acc" "$key" || echo unknown
+# 状态文件里读一个键；缺失返回 unknown（供 UI 区分「未知」与「空」）
+_line_state() {
+	local v
+	v=$(state_read "$1" "$2")
+	[ -n "$v" ] && printf '%s' "$v" || printf 'unknown'
+}
+
+# 该账号是否已配置帐密（不打印凭据本身）
+_cred_ok() {
+	secret_read "$1" >/dev/null 2>&1 && echo 1 || echo 0
 }
 
 text_status() {
-	local ids acc iface dev ip st
+	local l acc iface dev ip st
 	load_settings
 	echo "=================================================="
-	echo " luci-app-campnet 校园网认证状态"
+	echo " luci-app-campnet 校园网认证状态    v$(camp_version)"
 	echo "=================================================="
 	echo " 启用      : $([ "$S_ENABLED" = "1" ] && echo 是 || echo 否)"
 	echo " 认证模式  : $S_AUTH_MODE   (网关 $S_GATEWAY)"
 	echo " 保活周期  : ${S_CHECK_INTERVAL}s  重试: ${S_MAX_RETRY}×${S_RETRY_DELAY}s"
 	echo " 服务keeper: $(_service_keepers) 个进程"
 	echo "--------------------------------------------------"
-	ids=$(camp_account_ids)
-	if [ -z "$ids" ]; then
-		echo "（未配置任何账号）"
-	fi
-	for acc in $ids; do
-		iface=$(acct_iface_effective "$acc"); dev=$(iface_to_dev "$iface")
+	local lines_n=0
+	lines_n=$(camp_line_ids | grep -c .)
+	[ "$lines_n" -gt 0 ] || echo "（尚未配置任何线路）"
+	for l in $(camp_line_ids); do
+		acc=$(line_account "$l"); [ -n "$acc" ] || acc="-"
+		iface=$(line_iface "$l"); dev=$(iface_to_dev "$iface")
 		ip=$(dev_ip "$dev")
-		st=$(_account_state "$acc" status)
-		printf ' 账号[%s] %-13s %-15s %s\n' "$acc" "$st" "${ip:--}" "iface=$iface dev=$dev"
+		st=$(_line_state "$l" status)
+		printf ' 线路[%-8s] %-13s %-15s 账号=%-8s 设备=%s\n' \
+			"$l" "$st" "${ip:--}" "$acc" "$dev"
 	done
 	echo "--------------------------------------------------"
 	echo " 最近日志 5 行:"
@@ -47,53 +63,79 @@ json_status() {
 		HAVE_JSHN=1
 	fi
 	load_settings
-	local ids acc iface dev ip st mac msg ts
-	if [ "$HAVE_JSHN" = "1" ]; then
-		json_init
-		json_add_object "settings"
+	local l acc iface dev ip st mac msg
+
+	if [ "$HAVE_JSHN" != "1" ]; then
+		printf '{"error":"jshn missing"}\n'
+		return 0
+	fi
+
+	json_init
+	json_add_object "settings"
 		json_add_boolean "enabled" "$S_ENABLED"
 		json_add_string "auth_mode" "$S_AUTH_MODE"
 		json_add_string "gateway" "$S_GATEWAY"
 		json_add_int "check_interval" "$S_CHECK_INTERVAL"
 		json_add_int "max_retry" "$S_MAX_RETRY"
+		json_add_int "retry_delay" "$S_RETRY_DELAY"
 		json_add_string "uplink" "$S_UPLINK"
 		json_add_boolean "dial_on_start" "$S_DIAL_ON_START"
-		json_close_object
+	json_close_object
 
-		json_add_int "keepers" "$(_service_keepers)"
+	json_add_string "version" "$(camp_version)"
+	json_add_int "keepers" "$(_service_keepers)"
+	json_add_int "line_limit" "$LINE_PER_ACCOUNT_MAX"
 
-		json_add_array "accounts"
-		ids=$(camp_account_ids)
-		for acc in $ids; do
-			iface=$(acct_iface_effective "$acc"); dev=$(iface_to_dev "$iface")
-			ip=$(dev_ip "$dev"); mac=$(dev_mac "$dev")
-			st=$(_account_state "$acc" status)
-			msg=$(state_read "$acc" msg)
-			json_add_object ""
-			json_add_string "id" "$acc"
-			json_add_boolean "enabled" "$(acct_enabled "$acc")"
+	# ---- 线路 ----
+	local online=0 total=0
+	json_add_array "lines"
+	for l in $(camp_line_ids); do
+		total=$((total + 1))
+		acc=$(line_account "$l")
+		iface=$(line_iface "$l"); dev=$(iface_to_dev "$iface")
+		ip=$(dev_ip "$dev"); mac=$(dev_mac "$dev")
+		st=$(_line_state "$l" status)
+		msg=$(state_read "$l" msg)
+		[ "$st" = "authenticated" ] && online=$((online + 1))
+
+		json_add_object ""
+			json_add_string "id" "$l"
+			json_add_boolean "enabled" "$(line_enabled "$l")"
+			json_add_string "account" "${acc:-}"
+			json_add_string "type" "$(line_type "$l")"
 			json_add_string "iface" "$iface"
 			json_add_string "dev" "$dev"
 			json_add_string "ip" "${ip:-}"
 			json_add_string "mac" "${mac:-}"
 			json_add_string "status" "$st"
 			json_add_string "msg" "$(sanitize_msg "${msg:-}")"
-			json_close_object
-		done
-		json_close_array
-		json_dump
-		return 0
-	fi
-	# 无 jshn 兜底：极简
-	printf '{"enabled":%s,"gateway":"%s","accounts":[' "$S_ENABLED" "$S_GATEWAY"
-	ids=$(camp_account_ids)
-	local first=1
-	for acc in $ids; do
-		[ "$first" -eq 1 ] || printf ','
-		first=0
-		iface=$(acct_iface_effective "$acc"); dev=$(iface_to_dev "$iface")
-		printf '{"id":"%s","dev":"%s","ip":"%s","status":"%s"}' \
-			"$acc" "$dev" "$(dev_ip "$dev")" "$(_account_state "$acc" status)"
+			# 门户回传的实名信息（可能为空，UI 需降级显示）
+			json_add_string "pname" "$(state_read "$l" pname)"
+			json_add_string "puser" "$(state_read "$l" puser)"
+			json_add_string "pgroup" "$(state_read "$l" pgroup)"
+			json_add_string "pfee" "$(state_read "$l" pfee)"
+		json_close_object
 	done
-	printf ']}'
+	json_close_array
+
+	# ---- 账号（身份）----
+	local ids n
+	json_add_array "accounts"
+	ids=$(camp_account_ids)
+	for acc in $ids; do
+		n=$(acct_line_count "$acc")
+		json_add_object ""
+			json_add_string "id" "$acc"
+			json_add_boolean "enabled" "$(acct_enabled "$acc")"
+			json_add_int "lines" "$n"
+			json_add_boolean "has_credential" "$(_cred_ok "$acc")"
+			# 该账号名下的线路（供 UI 表达归属关系）
+			json_add_string "line_ids" "$(acct_line_ids "$acc" | tr '\n' ' ')"
+		json_close_object
+	done
+	json_close_array
+
+	json_add_int "total" "$total"
+	json_add_int "online" "$online"
+	json_dump
 }

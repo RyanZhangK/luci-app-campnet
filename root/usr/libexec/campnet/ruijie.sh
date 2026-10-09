@@ -76,10 +76,11 @@ _poll_auth_result() {
 auth_ruijie() {
 	local dev="$DEV" host base rargs ip macl mac data resp attempt gw
 	host=$(_auth_host); base="https://$host"; rargs=$(_resolve_args)
-	CJ="$COOKIE_PREFIX.${ACCOUNT}.jar"
+	# cookie 必须按**线路**隔离：同一账号挂两条线路时共用 cookie 会互相踩
+	CJ="$COOKIE_PREFIX.${LINE:-$ACCOUNT}.jar"
 	ip=$(dev_ip "$dev")
 	mac=$(dev_mac "$dev")
-	[ -n "$ip" ] || { log ERROR "账号[$ACCOUNT] 接口 $dev 无 IPv4，无法认证"; return 1; }
+	[ -n "$ip" ] || { log ERROR "线路[${LINE:-$ACCOUNT}]（账号[$ACCOUNT]） 接口 $dev 无 IPv4，无法认证"; return 1; }
 	macl=$(printf '%s' "$mac" | tr 'A-Z' 'a-f')
 
 	_ensure_auth_route "$dev"
@@ -101,7 +102,7 @@ auth_ruijie() {
 	data="${data}&portalVer=0&tservertypeid=axe&realTerminalType=a&operatorastrict=0,1,2,3"
 	data="${data}&echostr=&loginTimes=&groupId=&url=http://${S_GATEWAY}/&remInfo=on"
 
-	log INFO "账号[$ACCOUNT] POST ${base}/webauth.do (dev=$dev ip=$ip mac=$macl)"
+	log INFO "线路[${LINE:-$ACCOUNT}]（账号[$ACCOUNT]） POST ${base}/webauth.do (dev=$dev ip=$ip mac=$macl)"
 	resp=$(curl -sSki -m 30 --interface "$dev" --noproxy '*' $rargs \
 		-b "$CJ" -c "$CJ" \
 		-H "Host: ${host}" \
@@ -117,22 +118,22 @@ auth_ruijie() {
 
 	# 3) 结果判定
 	if verify_internet "$dev"; then
-		log INFO "账号[$ACCOUNT] 登录成功（直连校验通过）"
+		log INFO "线路[${LINE:-$ACCOUNT}]（账号[$ACCOUNT]） 登录成功（直连校验通过）"
 		return 0
 	fi
 	case "$resp" in
 		*"正在进行外网"*|*"外网拨号"*|*"请稍候"*|*getAuthResult*)
-			log INFO "账号[$ACCOUNT] 提交成功，等待外网拨号完成"
+			log INFO "线路[${LINE:-$ACCOUNT}]（账号[$ACCOUNT]） 提交成功，等待外网拨号完成"
 			_poll_auth_result "$dev" "$USERNAME" "$S_PAGEID" && return 0
 			return 1
 			;;
 	esac
 	case "$resp" in
 		*"认证失败"*|*"登录失败"*|*"密码错误"*|*"余额不足"*|*"账号异常"*|*"不在上网时段"*|*"时段限制"*)
-			log WARN "账号[$ACCOUNT] 服务器拒绝: $(redact "$resp")"
+			log WARN "线路[${LINE:-$ACCOUNT}]（账号[$ACCOUNT]） 服务器拒绝: $(redact "$resp")"
 			return 1
 			;;
 	esac
-	log WARN "账号[$ACCOUNT] 登录未确认: $(redact "$resp")"
+	log WARN "线路[${LINE:-$ACCOUNT}]（账号[$ACCOUNT]） 登录未确认: $(redact "$resp")"
 	return 1
 }

@@ -15,7 +15,7 @@ CAMP_LIB=/usr/libexec/campnet/lib.sh
 # 1) 帐密
 secret_seed || {
 	mkdir -p /etc/campnet
-	printf '[default]\nusername=202524104131\npassword=240414\n' > /etc/campnet/.config
+	printf '[default]\nusername=\npassword=\n' > /etc/campnet/.config
 	chmod 600 /etc/campnet/.config
 }
 
@@ -23,21 +23,27 @@ secret_seed || {
 if [ ! -s /etc/config/campnet ]; then
 	uci -q <<-EOF
 		set campnet.settings=settings
-		set campnet.settings.auth_mode=ruijie
+		set campnet.settings.auth_mode=auto
 		set campnet.settings.gateway=10.0.1.51
 		set campnet.settings.enabled=1
-		set campnet.settings.check_interval=120
+		set campnet.settings.check_interval=60
 		set campnet.settings.max_retry=3
 		set campnet.settings.retry_delay=5
 		set campnet.settings.uplink=auto
 		set campnet.settings.dial_on_start=1
 		set campnet.main=account
 		set campnet.main.enabled=1
-		set campnet.main.iface=wan
-		set campnet.main.create_vlan=0
+		set campnet.wan=line
+		set campnet.wan.enabled=1
+		set campnet.wan.account=main
+		set campnet.wan.type=wan
+		set campnet.wan.iface=wan
 		commit campnet
 	EOF
 fi
+
+# 2b) v0.x「账号即线路」的旧配置升级到新模型（幂等）
+[ -x /usr/libexec/campnet/campnet ] && /usr/libexec/campnet/campnet migrate >/dev/null 2>&1
 
 # 3) 自启
 [ -x /etc/init.d/campnet ] && /etc/init.d/campnet enable 2>/dev/null
