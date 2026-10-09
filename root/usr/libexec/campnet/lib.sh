@@ -661,28 +661,39 @@ camp_check_update() {
 		fi
 	fi
 
-	latest=$(curl -s -m 8 --noproxy '*' -H 'User-Agent: luci-app-campnet' \
+	remote=$(curl -s -m 8 --noproxy '*' -H 'User-Agent: luci-app-campnet' \
 		"https://api.github.com/repos/$CAMP_REPO/tags" 2>/dev/null \
 		| grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' \
 		| sed 's/.*:[[:space:]]*"\(.*\)"$/\1/' \
 		| sed 's/^[vV]//' \
 		| sort -t. -k1,1n -k2,2n -k3,3n 2>/dev/null | tail -1)
 
-	# 有更新：latest 与当前不同，且 latest 排序更大（不比字符串，避免 1.10 < 1.9 的坑）
-	[ -n "$latest" ] && [ "$latest" != "$cur" ] || latest=""
+	# 三态要分清，否则界面无法区分「已是最新」和「根本取不到远端」：
+	#   checked=0            → 没拿到（无网 / 被墙 / 仓库没有 tag）
+	#   checked=1, latest="" → 拿到了，且已是最新
+	#   checked=1, latest=X  → 有更新
+	if [ -n "$remote" ]; then
+		checked=1
+		if [ "$remote" = "$cur" ]; then latest=""; else latest="$remote"; fi
+	else
+		checked=0
+		latest=""
+	fi
 
 	mkdir -p "$(dirname "$CAMP_UPDATE_CACHE")" 2>/dev/null
-	if [ -f /usr/share/libubox/jshn.sh ]; then
-		( . /usr/share/libubox/jshn.sh
-		  json_init
-		  json_add_string version "$cur"
-		  json_add_string latest "$latest"
-		  json_add_string url "https://github.com/$CAMP_REPO"
-		  json_dump ) | tee "$CAMP_UPDATE_CACHE" 2>/dev/null \
-			|| printf '{"version":"%s","latest":"%s","url":"https://github.com/%s"}\n' \
-				"$cur" "$latest" "$CAMP_REPO"
-	else
-		printf '{"version":"%s","latest":"%s","url":"https://github.com/%s"}\n' \
-			"$cur" "$latest" "$CAMP_REPO" | tee "$CAMP_UPDATE_CACHE"
-	fi
+	gen_update_json() {
+		if [ -f /usr/share/libubox/jshn.sh ]; then
+			. /usr/share/libubox/jshn.sh
+			json_init
+			json_add_string version "$cur"
+			json_add_string latest "$latest"
+			json_add_string url "https://github.com/$CAMP_REPO"
+			json_add_boolean checked "$checked"
+			json_dump
+		else
+			printf '{"version":"%s","latest":"%s","url":"https://github.com/%s","checked":%s}\n' \
+				"$cur" "$latest" "$CAMP_REPO" "$checked"
+		fi
+	}
+	gen_update_json | tee "$CAMP_UPDATE_CACHE" 2>/dev/null || gen_update_json
 }

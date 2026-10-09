@@ -340,8 +340,14 @@ function renderVersionCard(st) {
 			btn.textContent = _('检查更新');
 			r = r || {};
 			while (box.firstChild) box.removeChild(box.firstChild);
-			if (!r.latest) {
-				box.appendChild(E('span', {}, [ _('已是最新版本（或暂时取不到远端版本）。') ]));
+			if (!r.checked) {
+				box.appendChild(E('span', {}, [
+					_('暂时无法获取远端版本（检查网络，或仓库尚无 tag）。') + ' '
+				]));
+			} else if (!r.latest) {
+				box.appendChild(E('span', {}, [
+					_('已是最新版本（%s）。').format('v' + (r.version || '?')) + ' '
+				]));
 			} else {
 				box.appendChild(E('span', {}, [
 					_('发现新版本 %s').format(r.latest) + ' — ',
