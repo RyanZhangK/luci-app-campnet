@@ -4,13 +4,8 @@
 # 以**线路**为输出单位：一条线路可能是一个账号的一次会话。
 # ============================================================
 
-CAMP_VERSION_FILE=/usr/libexec/campnet/VERSION
-
-camp_version() {
-	local v
-	v=$(cat "$CAMP_VERSION_FILE" 2>/dev/null | tr -d ' \n\r')
-	echo "${v:-unknown}"
-}
+# 版本号统一由 lib.sh 的 camp_version() 提供（此前这里有一份重复实现，
+# 两处行为还略有差异，容易改一处漏一处）
 
 # 服务存活：keeper 进程数
 _service_keepers() {

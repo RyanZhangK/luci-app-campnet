@@ -40,8 +40,11 @@ start_service() {
 		fi
 		[ "$(acct_enabled "$acc")" = "1" ] || { log INFO "线路[$l] 的账号[$acc] 已停用，跳过"; continue; }
 
+		# 实例名不能只用归一化后的名字：uci 段名允许 - . _，
+		# line-2 / line_2 / line.2 归一化后都是 line_2，procd 实例会撞名，
+		# 结果是某条线路的 keeper 起不来。追加名字哈希保证唯一。
 		san=$(printf '%s' "$l" | tr -c 'A-Za-z0-9_' '_')
-		procd_open_instance "keeper_${san}"
+		procd_open_instance "keeper_${san}_$(hash_str "$l" 8)"
 		procd_set_param command /bin/sh "$CAMP_KEEPER" --line "$l"
 		procd_set_param respawn 5 5 60
 		procd_set_param stdout 1

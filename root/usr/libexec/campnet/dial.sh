@@ -68,6 +68,18 @@ _line_mac() {
 	echo "$mac"
 }
 
+# 上行接口当前的默认路由 metric（主 wan 通常是 0）。
+# 新接口若用同一个值，两条默认路由会打架，最坏直接把主路由顶掉、整机断网
+# （本项目真的这么断过一次）。所以 route_metric 必须**严格大于**它。
+_uplink_metric() {
+	local dev m
+	dev=$(_resolve_uplink)
+	m=$(ip route show default dev "$dev" 2>/dev/null \
+		| sed -n 's/.* metric \([0-9][0-9]*\).*/\1/p' | head -1)
+	case "$m" in ''|*[!0-9]*) m=0 ;; esac
+	printf '%s' "$m"
+}
+
 # macvlan 挂在哪个物理设备上：优先取「类型=wan 的那条线路」的接口，
 # 退回到 wan 接口。类型=wan 的线路才是真正复用物理上行的那条。
 _resolve_uplink() {
@@ -119,22 +131,108 @@ _balance_targets() {
 	echo "$out"
 }
 
+# 从登记表里移除一条记录
+#
+# 不能写成 `grep -v ... && mv`：当最后一条记录被删掉、grep 输出为空时，
+# grep 返回 1，mv 就不会执行，那条记录会永远留在登记表里。
+_unmark() {
+	[ -f "$CAMP_CREATED" ] || return 0
+	if grep -qF -- "$*" "$CAMP_CREATED" 2>/dev/null; then
+		grep -vxF -- "$*" "$CAMP_CREATED" > "$CAMP_CREATED.tmp" 2>/dev/null
+		mv "$CAMP_CREATED.tmp" "$CAMP_CREATED" 2>/dev/null
+	fi
+	return 0
+}
+
+# ------------------------------------------------------------
+# 回收「已不在目标集里」的资源
+#
+# 触发场景：把某条线路 enabled=0、删掉线路、或线路数从 ≥2 降到 1。
+# 只动 .created 登记过的、本插件创建的东西，不碰用户自己的配置。
+#
+# 不做的后果（实测踩过）：campnet_rule 仍指向 campnet_bal，而 campnet_bal
+# 的成员指向一个已经删掉的接口 —— mwan3 策略引用不存在的接口会造成
+# 流量黑洞，而不是自动回落到默认策略。
+# ------------------------------------------------------------
+_prune_resources() {
+	local keep l s z net devname
+
+	# 保留集：仍然启用且已绑定账号的 macvlan 线路的设备名
+	keep=""
+	for l in $(camp_line_ids); do
+		[ "$(line_enabled "$l")" = "1" ] || continue
+		[ "$(line_type "$l")" != "wan" ] || continue
+		[ -n "$(line_account "$l")" ] || continue
+		keep="$keep $(dev_name_for "$l")"
+	done
+
+	# network 接口段
+	for s in $(awk '$1=="netiface"{print $2}' "$CAMP_CREATED" 2>/dev/null); do
+		case " $keep " in *" $s "*) continue ;; esac
+		log INFO "dial: 回收已停用线路的接口 $s"
+		ifdown "$s" >/dev/null 2>&1 || true
+		uci -q delete "network.$s" 2>/dev/null
+		_unmark netiface "$s"
+		DIRTY=1
+	done
+
+	# netifd device 段（先删内核设备再删段）
+	for s in $(awk '$1=="netdev"{print $2}' "$CAMP_CREATED" 2>/dev/null); do
+		devname=$(uci -q get "network.$s.name")
+		case " $keep " in *" $devname "*) continue ;; esac
+		[ -n "$devname" ] && [ -d "/sys/class/net/$devname" ] \
+			&& ip link del dev "$devname" 2>/dev/null
+		uci -q delete "network.$s" 2>/dev/null
+		_unmark netdev "$s"
+		DIRTY=1
+	done
+
+	# 防火墙 wan 区域成员（不能放管道里：子 shell 里 _unmark 影响不到外层）
+	for s in $(awk '$1=="fwlist"{print $2"|"$3}' "$CAMP_CREATED" 2>/dev/null); do
+		z=${s%%|*}; net=${s#*|}
+		[ -n "$z" ] && [ -n "$net" ] || continue
+		case " $keep " in *" $net "*) continue ;; esac
+		uci -q del_list "firewall.@zone[$z].network=$net" 2>/dev/null
+		_unmark fwlist "$z" "$net"
+		DIRTY=1
+	done
+
+	# mwan3 接口 / 成员
+	for s in $(awk '$1=="mwan3iface"{print $2}' "$CAMP_CREATED" 2>/dev/null); do
+		case " $keep " in *" $s "*) continue ;; esac
+		uci -q delete "mwan3.$s" 2>/dev/null
+		_unmark mwan3iface "$s"
+		DIRTY=1
+	done
+	for s in $(awk '$1=="mwan3member"{print $2}' "$CAMP_CREATED" 2>/dev/null); do
+		case " $keep " in *" ${s%_campnet} "*) continue ;; esac
+		uci -q delete "mwan3.$s" 2>/dev/null
+		_unmark mwan3member "$s"
+		DIRTY=1
+	done
+	return 0
+}
+
 # ------------------------------------------------------------
 # pass1：macvlan + DHCP + 防火墙
 # ------------------------------------------------------------
 dial_net_setup() {
-	local uplink l acc z devname devsec mac curmac base used_names
+	local uplink l acc z devname devsec mac curmac base used_names rmet acct_seen cnt
+	local up_metric
 	uplink=$(_resolve_uplink)
 	if [ -z "$uplink" ] || [ ! -d "/sys/class/net/$uplink" ]; then
 		log WARN "dial: 上行链路 '$uplink' 不存在，跳过"
 		return 0
 	fi
-	log INFO "dial: 上行链路 = $uplink"
+	up_metric=$(_uplink_metric)
+	log INFO "dial: 上行链路 = $uplink (metric=$up_metric)"
 
 	used_names=""
 	for l in $(camp_line_ids); do
 		[ "$(line_enabled "$l")" = "1" ] || continue
-		[ "$(line_type "$l")" != "wan" ] || continue     # 复用物理接口的线路不需要建设备
+		# 复用物理接口的线路不建设备（line_iface 把 wan/physical 都当复用，
+		# 这里必须用同一判据，否则 type=physical 会建出一半矛盾的状态）
+		case "$(line_type "$l")" in wan|physical) continue ;; esac
 		acc=$(line_account "$l")
 		[ -n "$acc" ] && [ "$(acct_enabled "$acc")" = "1" ] || {
 			log WARN "dial: 线路[$l] 未绑定有效账号，跳过"
@@ -180,7 +278,10 @@ dial_net_setup() {
 		# 关键：显式抬高路由 metric。主 wan 的默认路由 metric 为 0，若本接口也
 		# 用 0，netifd 装上来的第二条默认路由会顶掉 wan —— 实测会让整机断网。
 		# mwan3 走 fwmark 独立路由表，不依赖这里的 metric，抬高无副作用。
-		uci_chk "network.$devname.metric" "$(uciqn "campnet.$l.route_metric" 20)"
+		# 钳制到严格大于上行接口的 metric，避免抢默认路由
+		rmet=$(uciqn "campnet.$l.route_metric" 20)
+		[ "$rmet" -gt "$up_metric" ] || rmet=$((up_metric + 10))
+		uci_chk "network.$devname.metric" "$rmet"
 		mark netiface "$devname"
 
 		# 3) 防火墙 wan 区域成员
@@ -203,7 +304,7 @@ dial_net_setup() {
 	# 立即建立并拉起 DHCP（先把 MAC 落实，再 ifup，避免 DHCP 拿到旧 MAC 的租约）
 	for l in $(camp_line_ids); do
 		[ "$(line_enabled "$l")" = "1" ] || continue
-		[ "$(line_type "$l")" != "wan" ] || continue
+		case "$(line_type "$l")" in wan|physical) continue ;; esac
 		devname=$(dev_name_for "$l")
 		mac=$(line_opt "$l" macaddr)
 		# 设备若已存在（上一轮 dial 建的），netifd 不会就地改 MAC，这里直接落一次
@@ -227,7 +328,26 @@ dial_mwan3_setup() {
 	local targets n t iface metric weight member desired cur metric_mismatch member_metric oldm
 	targets=$(_balance_targets)
 	n=$(echo $targets | wc -w)
-	[ "$n" -ge 2 ] || { log INFO "dial: 可用通道 $n 条（<2），无需 mwan3 均衡"; return 0; }
+	[ "$n" -ge 2 ] || {
+		# 不足两条通道时必须把本插件的 mwan3 配置撤干净。
+		# 否则 policy 会指向已删除的接口 —— mwan3 遇到这种引用是流量黑洞，
+		# 而不是自动回落到默认策略。
+		local kind had=0
+		for kind in mwan3rule mwan3policy mwan3member mwan3iface; do
+			for s in $(awk -v k="$kind" '$1==k{print $2}' "$CAMP_CREATED" 2>/dev/null); do
+				uci -q get "mwan3.$s" >/dev/null 2>&1 && { uci -q delete "mwan3.$s"; had=1; }
+				_unmark "$kind" "$s"
+			done
+		done
+		if [ "$had" = "1" ]; then
+			uci -q commit mwan3 2>/dev/null
+			mwan3_available && "$MWAN3_BIN" restart >/dev/null 2>&1
+			log INFO "dial: 可用通道 $n 条（<2），已撤除 mwan3 均衡配置"
+		else
+			log INFO "dial: 可用通道 $n 条（<2），无需 mwan3 均衡"
+		fi
+		return 0
+	}
 	mwan3_available || { log WARN "dial: mwan3 不可用，跳过均衡注入（opkg install mwan3）"; return 0; }
 
 	# interface / member
@@ -250,8 +370,9 @@ dial_mwan3_setup() {
 			uci -q set "mwan3.$iface.enabled=1"
 			uci -q set "mwan3.$iface.family=ipv4"
 			uci -q set "mwan3.$iface.reliability=2"
-			uci -q add_list "mwan3.$iface.track_ip=223.5.5.5"
-			uci -q add_list "mwan3.$iface.track_ip=119.29.29.29"
+			for ip in $S_TRACK_IPS; do
+				uci -q add_list "mwan3.$iface.track_ip=$ip"
+			done
 			mark mwan3iface "$iface"
 			DIRTY=1
 		fi
@@ -407,6 +528,7 @@ dial_setup() {
 
 	dial_net_setup
 	DIRTY=0   # pass1 变更已提交；pass2 只反映 mwan3 变更
+	_prune_resources          # 回收已停用/已删除线路留下的资源
 	dial_mwan3_setup
 
 	lock_release dial
@@ -445,6 +567,17 @@ dial_teardown() {
 		for s in $(uci show network 2>/dev/null | sed -n 's/^network\.\([^.]*\)=.*/\1/p'); do
 			case "$s" in campnet_*|campd_*) uci -q delete "network.$s" ;; esac
 		done
+		# 防火墙成员同样要按命名清，否则 firewall 起不来（引用不存在的接口）
+		local zi=0 zn
+		while :; do
+			zn=$(uci -q get "firewall.@zone[$zi].name")
+			[ -n "$zn" ] || break
+			for net in $(uci -q get "firewall.@zone[$zi].network"); do
+				case "$net" in campnet_*) uci -q del_list "firewall.@zone[$zi].network=$net" ;; esac
+			done
+			zi=$((zi + 1))
+		done
+		uci -q commit firewall 2>/dev/null
 		uci -q commit network 2>/dev/null
 		mwan3_available && "$MWAN3_BIN" restart >/dev/null 2>&1
 		log INFO "dial: 已按命名撤销本插件资源"

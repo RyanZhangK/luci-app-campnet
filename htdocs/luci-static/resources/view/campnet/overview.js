@@ -4,7 +4,9 @@
 'require ui';
 
 var getStatus = rpc.declare({ object: 'luci.campnet', method: 'getStatus' });
-var authLine = rpc.declare({ object: 'luci.campnet', method: 'auth', params: [ 'line' ] });
+var authLine = rpc.declare({
+	object: 'luci.campnet', method: 'auth', params: [ 'line', 'force' ]
+});
 var lineApply = rpc.declare({ object: 'luci.campnet', method: 'lineApply' });
 var lineTeardown = rpc.declare({ object: 'luci.campnet', method: 'lineTeardown' });
 
@@ -31,6 +33,22 @@ function badge(st) {
 	return E('span', { 'class': 'campnet-badge', 'style': 'background:%s'.format(s.bg) }, [ s.text ]);
 }
 
+/* 认证/编排改成后台执行后，RPC 会立刻返回，真正完成要等几十秒。
+ * 这里轮询 getStatus 直到没有线路处于 authing（或超时），
+ * 让"点了没反应"变成"看得见在跑"。 */
+function waitForSettle(maxMs) {
+	var t0 = Date.now();
+	return new Promise(function (resolve) {
+		(function tick() {
+			getStatus().then(function (st) {
+				var busy = (st.lines || []).some(function (l) { return l.status === 'authing'; });
+				if (!busy || Date.now() - t0 > maxMs) return resolve(st);
+				window.setTimeout(tick, 1500);
+			}).catch(function () { resolve(null); });
+		})();
+	});
+}
+
 /* 按钮：点击后进入加载态（改文案 + 禁用），而不是只变灰 ——
  * 状态可见性要求用户知道"我点的东西正在发生"。 */
 function actionBtn(text, busyText, cls, fn) {
@@ -42,10 +60,18 @@ function actionBtn(text, busyText, cls, fn) {
 		if (busyText) b.textContent = busyText;
 		Promise.resolve().then(fn).then(function (r) {
 			var ok = !r || r.ok !== false;
-			ui.addNotification(null, E('p', {}, [
-				ok ? _('操作已执行') : _('操作失败，详见「插件日志」页')
-			]), ok ? 'info' : 'error');
-			window.setTimeout(function () { location.reload(); }, 800);
+			if (!ok) {
+				b.disabled = false;
+				b.textContent = orig;
+				ui.addNotification(null, E('p', {}, [ _('操作失败，详见「插件日志」页') ]), 'error');
+				return;
+			}
+			/* 后端已改为"提交后台执行 + 立即返回"，所以要等它真正跑完 */
+			b.textContent = busyText || orig;
+			return waitForSettle(60000).then(function () {
+				ui.addNotification(null, E('p', {}, [ _('操作已完成') ]), 'info');
+				window.setTimeout(function () { location.reload(); }, 700);
+			});
 		}).catch(function (e) {
 			b.disabled = false;
 			b.textContent = orig;
@@ -197,7 +223,7 @@ return view.extend({
 		var accountCard = E('div', { 'class': 'cbi-section' }, [
 			E('h3', {}, [ _('账号') ]),
 			E('table', { 'class': 'table cbi-section-table' }, accountRows),
-			anyInfo ? E([]) : E('div', { 'class': 'cbi-section-descr' },
+			anyInfo ? null : E('div', { 'class': 'cbi-section-descr' },
 				[ _('实名信息由校园网门户回传，需要线路处于已认证状态。') ])
 		]);
 
@@ -218,6 +244,12 @@ return view.extend({
 			E('h3', {}, [ _('危险操作') ]),
 			E('div', { 'class': 'cbi-section-descr' },
 				[ _('撤销会删除本插件创建的全部 macvlan 设备、防火墙与 mwan3 条目，之后需要重新「重建多播线路」。') ]),
+			E('div', { 'style': 'margin-bottom:10px' }, [
+				actionBtn(_('强制重新登录全部'), _('重新登录中…'), 'cbi-button-reset',
+					function () { return authLine('all', '--force'); })
+			]),
+			E('div', { 'class': 'cbi-section-descr', 'style': 'margin-bottom:8px' },
+				[ _('强制重登会对已在线线路再发一次认证请求，可能触发校园网风控，非必要不用。') ]),
 			actionBtnTearDown()
 		]);
 

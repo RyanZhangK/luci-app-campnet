@@ -80,6 +80,7 @@ case "$1" in
 		json_close_object
 		json_add_object "auth"
 			json_add_string "line" "string"
+			json_add_string "force" "string"
 		json_close_object
 		json_add_object "test"
 			json_add_string "line" "string"
@@ -126,15 +127,35 @@ case "$1" in
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
 				get_arg line all || exit 0
 				line="$ARG_VAL"
+				get_arg force "" || exit 0
+				force="$ARG_VAL"
 				json_cleanup 2>/dev/null
-				run_cli "$CAMP" auth "$line" --force
+				case "$force" in --force) ;; *) force="" ;; esac
+				# 默认**不**强制：run_login 的在线短路会先判一次，
+				# 已在线就什么都不做。恒用 --force 会对已认证的线路再发一遍
+				# 认证请求，对 eportal 门户是无效请求，可能触发校园网风控/锁号。
+				#
+				# 后台执行：单次认证最坏 = max_retry × (curl 30s + 拨号轮询)，
+				# 同步等待必然超过 ubus/rpcd 的调用超时 —— 用户看到"失败"，
+				# 而后端其实还在跑。前端改为轮询 getStatus 看结果。
+				( "$CAMP" auth "$line" $force >/dev/null 2>&1 & ) </dev/null >/dev/null 2>&1
+				json_init
+				json_add_boolean ok 1
+				json_add_string msg "已提交，后台认证中"
+				json_dump
 				;;
 			test)
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
 				get_arg line "" || exit 0
 				line="$ARG_VAL"
 				json_cleanup 2>/dev/null
-				run_cli "$CAMP" test "$line"
+				# 返回文本而不是 ok/failed —— campnet test 的价值就在于它打印的
+				# 接口/IP/探测结果，丢掉输出等于没有这个功能。
+				out=$("$CAMP" test "$line" 2>&1)
+				json_init
+				json_add_boolean ok "$([ -n "$out" ] && echo 1 || echo 0)"
+				json_add_string text "$out"
+				json_dump
 				;;
 			portal)
 				read -r input; [ -n "$input" ] && json_load "$input" 2>/dev/null
@@ -157,13 +178,29 @@ case "$1" in
 				[ -n "$bad" ] && { fail_json "参数 $bad 类型非法：请检查前端 rpc 调用是否写成了对象形式"; exit 0; }
 				[ -n "$account" ] || account=main
 				if [ -n "$username" ] && [ -n "$password" ]; then
-					run_cli "$CAMP" secret set "$username" "$password" "$account"
+					# 密码走 stdin（`-`）：否则它会出现在 ps / /proc/<pid>/cmdline 里
+					json_init
+					if printf '%s\n' "$password" \
+						| "$CAMP" secret set "$username" - "$account" >/dev/null 2>&1; then
+						json_add_boolean ok 1
+						json_add_string msg "ok"
+					else
+						json_add_boolean ok 0
+						json_add_string msg "保存失败，详见 /var/log/campnet/campnet.log"
+					fi
+					json_dump
 				else
 					fail_json "用户名与密码都不能为空"
 				fi
 				;;
 			lineApply)
-				run_cli "$CAMP" dial setup
+				# 同 auth：编排涉及 mwan3 restart 与 firewall reload，耗时不可控，
+				# 后台执行 + 前端轮询状态。
+				( "$CAMP" dial setup >/dev/null 2>&1 & ) </dev/null >/dev/null 2>&1
+				json_init
+				json_add_boolean ok 1
+				json_add_string msg "已提交，后台编排中"
+				json_dump
 				;;
 			lineTeardown)
 				run_cli "$CAMP" dial teardown
@@ -173,7 +210,7 @@ case "$1" in
 				get_arg refresh "" || exit 0
 				refresh="$ARG_VAL"
 				json_cleanup 2>/dev/null
-				# shellcheck disable=SC2086
+				case "$refresh" in --refresh) ;; *) refresh="" ;; esac
 				"$CAMP" checkupdate $refresh 2>/dev/null
 				;;
 			setService)

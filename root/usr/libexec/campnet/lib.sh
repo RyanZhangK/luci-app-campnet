@@ -18,6 +18,7 @@ CAMP_PREFIX=campnet
 MAX_LOG_LINES=800
 TRIM_LOG_LINES=500
 COOKIE_PREFIX=/tmp/campnet-cookie
+CAMP_TMP_DIR=/tmp/campnet-tmp         # 存放含凭据的临时文件（0700）
 
 # ------------------------------------------------------------
 # 基础工具
@@ -37,6 +38,42 @@ uciqn() {
 	esac
 }
 
+# 建一个私有临时文件。mkdtemp 语义：目录 0700、文件 0600（mktemp 默认）。
+# 用来承载含账号密码的请求体 —— 直接写 /tmp/xxx 会按 umask 落成 0644。
+camp_tmpfile() { # [前缀]
+	mkdir -p "$CAMP_TMP_DIR" 2>/dev/null && chmod 700 "$CAMP_TMP_DIR" 2>/dev/null
+	mktemp "$CAMP_TMP_DIR/${1:-tmp}.XXXXXX" 2>/dev/null
+}
+
+# 稳定短哈希（默认 8 位十六进制）。
+# 纯 awk 实现，不依赖 cksum/od/xxd —— 精简固件常常一个都没有。
+# 必须按**字节**取值：若按字母表索引，'-' '.' '_' 都会算成 0，
+# 于是 line-2 / line_2 / line.2 三个不同的 uci 段会得到同一个哈希
+# ——那正是要避免的撞名。LC_ALL=C 保证 gawk 也走字节语义。
+#
+# 模数必须 < 2^31：busybox awk 的 printf "%08x" 对 >= 2^31 的值会**钳到
+# 7fffffff**（实测），用 2^32 取模会让一半以上的名字撞成同一个哈希。
+hash_str() { # <字符串> [位数=8]
+	S="$1" N="${2:-8}" LC_ALL=C awk 'BEGIN {
+		for (i = 1; i < 256; i++) ord[sprintf("%c", i)] = i
+		s = ENVIRON["S"]
+		h = 0
+		for (i = 1; i <= length(s); i++)
+			h = (h * 131 + ord[substr(s, i, 1)]) % 2147483647
+		printf "%s", substr(sprintf("%08x", h), 1, ENVIRON["N"] + 0)
+	}'
+}
+
+# 取整数并钳制下限。ciqn 把 "0" 当成合法值，于是 check_interval=0 会让
+# keeper 忙循环（nap 0 立刻返回）、retry_delay=0 会让认证失败后无间隔连打
+# 三次（校园网很容易因此风控/锁号）、poll_interval=0 会变成 20 次无间隔轮询。
+uciqmin() { # <key> <默认> <最小值>
+	local v
+	v=$(uciqn "$1" "$2")
+	[ "$v" -ge "$3" ] 2>/dev/null || v="$3"
+	printf '%s' "$v"
+}
+
 # 日志：写文件（行数轮转）+ 诊断输出
 # 诊断必须走 **stderr**：本文件里多处形如 `mac=$(_acct_mac "$acc")` 的命令替换，
 # 若 log() 写 stdout，被替换函数内部的提示会被一并捕获进变量值，污染返回值
@@ -52,7 +89,9 @@ log() {
 	fi
 	ts=$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)
 	printf '[%s] [%s] %s\n' "$ts" "$lvl" "$msg" >> "$CAMP_LOG" 2>/dev/null || true
-	printf '[%s] %s\n' "$lvl" "$msg" >&2
+	# 只在交互式终端回显：init.d 把 stderr 收进 syslog，无条件回显会让
+	# 每条日志在 syslog 里再出现一遍（双写）。
+	[ -t 2 ] && printf '[%s] %s\n' "$lvl" "$msg" >&2
 	return 0
 }
 
@@ -70,19 +109,37 @@ redact() {
 		| cut -c1-400
 }
 
-# URL 编码（POST 参数用）
+# URL 编码（RFC3986 unreserved 集合：A-Za-z0-9-_.~）
+#
+# 用**单个 awk 进程**按字节编码。旧实现每字符 fork 一次 cut+printf，
+# 一个 268 字符的 queryString 编码两次要 **~1.8 秒**（ipq807x 实测）；
+# 而 eportal 登录正需要对 queryString 做双重编码 —— 光编码就吃掉了
+# curl 超时余量，还会拖垮 ubus 调用。现在单次 ~50ms（36 倍）。
+#
+# 必须**按字节**遍历：ASCII 凭据无感，但用户名/密码含中文时得按 UTF-8
+# 字节逐个编码（'中' → %E4%B8%AD），按码点编码是错的。
+# busybox awk 的 length()/substr() 都是字节语义（实测 length("中")==3）。
+#
+# 用 ENVIRON 传参而不是管道：管道会把值里的换行当记录分隔符，
+# 导致换行之后的内容被静默丢弃。
+#
+# LC_ALL=C 不能省：GNU awk 在多字节 locale 下是**按字符**的（本地开发机
+# 就是 gawk），会把 '中' 编成 1 个码点而不是 3 个 UTF-8 字节。
+# 加 LC_ALL=C 后 gawk 也切回字节语义，两个平台结果一致。
 urlencode() {
-	local s="$1" out="" c i n
-	i=1; n=${#s}
-	while [ "$i" -le "$n" ]; do
-		c=$(printf '%s' "$s" | cut -c "$i")
-		case "$c" in
-			[a-zA-Z0-9._~-]) out="${out}${c}" ;;
-			*) out="${out}$(printf '%%%02X' "'$c")" ;;
-		esac
-		i=$((i + 1))
-	done
-	printf '%s' "$out"
+	S="$1" LC_ALL=C awk 'BEGIN {
+		for (i = 1; i < 256; i++) byte[sprintf("%c", i)] = i
+		safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~"
+		s = ENVIRON["S"]
+		n = length(s)
+		out = ""
+		for (i = 1; i <= n; i++) {
+			c = substr(s, i, 1)
+			if (index(safe, c) > 0) out = out c
+			else out = out sprintf("%%%02X", byte[c])
+		}
+		printf "%s", out
+	}'
 }
 
 # ------------------------------------------------------------
@@ -93,11 +150,11 @@ load_settings() {
 	S_AUTH_MODE=$(uciq campnet.settings.auth_mode);          S_AUTH_MODE=${S_AUTH_MODE:-auto}
 	S_GATEWAY=$(uciq campnet.settings.gateway);              S_GATEWAY=${S_GATEWAY:-10.0.1.51}
 	S_PROBE_URL=$(uciq campnet.settings.probe_url);          S_PROBE_URL=${S_PROBE_URL:-http://connect.rom.miui.com/generate_204}
-	S_CHECK_INTERVAL=$(uciqn campnet.settings.check_interval 60)
-	S_MAX_RETRY=$(uciqn campnet.settings.max_retry 3)
-	S_RETRY_DELAY=$(uciqn campnet.settings.retry_delay 5)
+	S_CHECK_INTERVAL=$(uciqmin campnet.settings.check_interval 60 5)
+	S_MAX_RETRY=$(uciqmin campnet.settings.max_retry 3 1)
+	S_RETRY_DELAY=$(uciqmin campnet.settings.retry_delay 5 1)
 	S_POLL_MAX=$(uciqn campnet.settings.poll_max 20)
-	S_POLL_INTERVAL=$(uciqn campnet.settings.poll_interval 2)
+	S_POLL_INTERVAL=$(uciqmin campnet.settings.poll_interval 2 1)
 	S_UPLINK=$(uciq campnet.settings.uplink);                S_UPLINK=${S_UPLINK:-auto}
 	S_DIAL_ON_START=$(uciqn campnet.settings.dial_on_start 1)
 	S_WLANACNAME=$(uciq campnet.settings.wlanacname);        S_WLANACNAME=${S_WLANACNAME:-BRAS}
@@ -164,7 +221,10 @@ acct_line_ids() {
 		[ "$(line_account "$l")" = "$1" ] && echo "$l"
 	done
 }
-acct_line_count() { acct_line_ids "$1" | grep -c . ; }
+acct_line_count() { acct_line_count_all "$1"; }
+# 该账号名下线路总数（含未启用）。LuCI 的 GridSection 是直接写 uci 的，
+# 绕过 CLI 的校验，所以运行期必须自己能查出超额并拒绝。
+acct_line_count_all() { acct_line_ids "$1" | grep -c . ; }
 
 # 多播命名助手（与 dial.sh 共用；确定性）
 #
@@ -317,6 +377,10 @@ secret_write() {
 	local acc="${1:-main}" user="$2" pass="$3" want
 	want=$(_secret_section "$acc")
 	mkdir -p "$CAMP_DIR" 2>/dev/null || return 1
+	# 先收紧 umask 再重定向：早期实现是先按默认 umask(022) 建出
+	# 0644 的临时文件、后面才 chmod 600 —— 明文密码在这两步之间可被读走。
+	local om; om=$(umask)
+	umask 077
 	{
 		printf '# campnet 帐密 —— 请通过 LuCI/CLI 修改，勿直接编辑\n'
 		printf '# [default] = 主账号(main)；[account:<id>] = 附加账号\n'
@@ -356,10 +420,32 @@ secret_write() {
 			fi
 			printf '\n[%s]\nusername=%s\npassword=%s\n' "$want" "$user" "$pass"
 		fi
-	} > "$CAMP_SECRET.tmp" 2>/dev/null || return 1
+	} > "$CAMP_SECRET.tmp" 2>/dev/null || { umask "$om"; return 1; }
+	umask "$om"
 	chmod 600 "$CAMP_SECRET.tmp"
 	mv "$CAMP_SECRET.tmp" "$CAMP_SECRET" || return 1
 	chmod 600 "$CAMP_SECRET"
+	return 0
+}
+
+# secret_delete <account> —— 删除该账号的凭据分节（删号时必须调用，
+# 否则明文密码会永远留在 /etc/campnet/.config 里）
+secret_delete() {
+	local acc="${1:-main}" want
+	want=$(_secret_section "$acc")
+	[ -f "$CAMP_SECRET" ] || return 0
+	awk -v want="$want" '
+		/^[[:space:]]*\[/ {
+			sec=$0; gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec)
+			if (sec==want) { skip=1; next }
+			skip=0
+			if (started) print ""; started=1
+		}
+		skip==0 && !/^[[:space:]]*#/ && !/^[[:space:]]*$/ { print }
+	' "$CAMP_SECRET" > "$CAMP_SECRET.tmp" 2>/dev/null || return 1
+	chmod 600 "$CAMP_SECRET.tmp" 2>/dev/null
+	mv "$CAMP_SECRET.tmp" "$CAMP_SECRET" 2>/dev/null || return 1
+	chmod 600 "$CAMP_SECRET" 2>/dev/null
 	return 0
 }
 
@@ -367,8 +453,9 @@ secret_write() {
 secret_seed() {
 	mkdir -p "$CAMP_DIR" 2>/dev/null
 	[ -f "$CAMP_SECRET" ] && { chmod 600 "$CAMP_SECRET" 2>/dev/null; return 0; }
+	local om; om=$(umask); umask 077
 	if [ -f "$CAMP_SECRET_DEFAULT" ]; then
-		cp "$CAMP_SECRET_DEFAULT" "$CAMP_SECRET" 2>/dev/null || return 1
+		cp "$CAMP_SECRET_DEFAULT" "$CAMP_SECRET" 2>/dev/null || { umask "$om"; return 1; }
 	else
 		# 内置兜底同样不带真实凭据：种子出来的是空模板，
 		# secret_read 会因 username/password 为空而判定「未配置」。
@@ -378,6 +465,7 @@ secret_seed() {
 			password=
 		EOF
 	fi
+	umask "$om"
 	chmod 600 "$CAMP_SECRET" 2>/dev/null
 	return 0
 }
@@ -436,7 +524,7 @@ probe_status() {
 verify_internet() {
 	local dev="$1"
 	if probe_online "$dev"; then return 0; fi
-	ping -c 1 -W 2 -I "$dev" 223.5.5.5 >/dev/null 2>&1 && return 0
+	ping -c 1 -W 2 -I "$dev" ${S_TRACK_IP1:-223.5.5.5} >/dev/null 2>&1 && return 0
 	return 1
 }
 
@@ -454,7 +542,9 @@ lock_get() {
 			[ "$(( $(date +%s) - ts ))" -gt 300 ] && rmdir "$lk" 2>/dev/null
 		fi
 		i=$((i + 1))
-		[ "$i" -gt 100 ] && return 1
+		# 单次认证最坏可达 max_retry × (curl 30s + 拨号轮询)，量级是分钟级。
+		# 原来 100×0.2s=20s 的上限太短，并发 keeper 会拿到 return 3 后静默跳过。
+		[ "$i" -gt 900 ] && return 1
 		sleep 0.2
 	done
 	return 0

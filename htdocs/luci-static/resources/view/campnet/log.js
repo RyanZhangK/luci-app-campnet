@@ -88,12 +88,18 @@ return view.extend({
 		var autoChk = E('input', { 'type': 'checkbox', 'id': 'campnet-log-auto' });
 		var timer = null;
 		autoChk.addEventListener('change', function () {
-			if (timer) { window.clearInterval(timer); timer = null; }
+			if (timer) { window.clearTimeout(timer); timer = null; }
 			if (autoChk.checked) {
-				timer = window.setInterval(function () {
-					if (document.hidden) return;      /* 后台标签页不刷 */
-					refreshBtn.click();
-				}, 5000);
+				/* 不要用 setInterval：LuCI 这个版本没有视图卸载钩子，
+				 * 离开页面后定时器会一直跑。改成自调度 setTimeout，
+				 * 并在每一跳检查元素是否还在文档里（即页面是否还挂载着）。 */
+				(function tick() {
+					timer = window.setTimeout(function () {
+						if (!document.contains(pre)) return;   /* 已离开该页 */
+						if (!document.hidden) refreshBtn.click();  /* 后台标签页不刷 */
+						tick();
+					}, 5000);
+				})();
 			}
 		});
 		levelSel.addEventListener('change', applyFilter);

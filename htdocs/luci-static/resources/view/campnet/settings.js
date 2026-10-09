@@ -74,7 +74,8 @@ return view.extend({
 		o.default = '1';
 		o.rmempty = false;
 
-		o = s.option(form.ListValue, 'account', _('归属账号'), _('这条线路用哪个账号上网。'));
+		o = s.option(form.ListValue, 'account', _('归属账号'),
+			_('这条线路用哪个账号上网（每个账号最多 %d 条，超出会被拒绝生效）。').format(limit));
 		accounts.forEach(function (a) { o.value(a.id, a.id); });
 		o.rmempty = true;
 
@@ -134,16 +135,19 @@ return view.extend({
 		o.value('eportal', _('eportal — 锐捷门户'));
 		o.default = 'auto';
 
+		/* datatype 用 range 而不是 uinteger：0 会让 keeper 忙循环
+		 * （保活周期 0 = 不停探测）、重试间隔 0 = 无间隔连打三次
+		 * （校园网很容易因此风控/锁号）。后端 uciqmin 还会再钳一次。 */
 		o = s.option(form.Value, 'check_interval', _('保活周期'), _('秒。掉线后最长等这么久才发现。'));
-		o.datatype = 'uinteger';
+		o.datatype = 'range(5,3600)';
 		o.default = '60';
 
 		o = s.option(form.Value, 'max_retry', _('重试次数'));
-		o.datatype = 'uinteger';
+		o.datatype = 'range(1,10)';
 		o.default = '3';
 
 		o = s.option(form.Value, 'retry_delay', _('重试间隔'), _('秒。'));
-		o.datatype = 'uinteger';
+		o.datatype = 'range(1,600)';
 		o.default = '5';
 
 		o = s.option(form.Flag, 'dial_on_start', _('开机自动编排'));
@@ -151,13 +155,31 @@ return view.extend({
 		o.rmempty = false;
 
 		/* ---------------- 高级（渐进披露：默认折叠） ---------------- */
-		s = m.section(form.NamedSection, 'settings', _('高级'),
-			_('认证不通时再按抓包调整；一般情况下不必动。'));
-		s.anonymous = true;
-
+		/* 同一个 uci section 只能有一个 NamedSection：原来拆成两节，
+		 * 生成的 DOM id 会重复，depends 求值也依赖 id 唯一性。
+		 * 折叠本来就是靠 depends 实现的，拆节纯属冗余。 */
 		o = s.option(form.Flag, 'show_advanced', _('展开高级参数'),
 			_('显示锐捷表单字段与超时设置。'));
 		o.default = '0';
+		o.rmempty = true;
+		/* 这是纯 UI 偏好，存 localStorage 而不是 uci：
+		 * 写 uci 会触发 servic reload，勾一下开关就把所有认证 keeper 重启一遍。 */
+		o.cfgvalue = function (sid) {
+			return window.localStorage.getItem('campnet.show_advanced') || '0';
+		};
+		o.write = function (sid, val) {
+			window.localStorage.setItem('campnet.show_advanced', val);
+			return Promise.resolve();
+		};
+		o.remove = function () {
+			window.localStorage.setItem('campnet.show_advanced', '0');
+			return Promise.resolve();
+		};
+
+		o = s.option(form.Value, 'track_ips', _('探测 IP'),
+			_('空格分隔。用于 mwan3 线路健康检查与外网连通判定。'));
+		o.default = '223.5.5.5 119.29.29.29';
+		o.depends('show_advanced', '1');
 		o.rmempty = true;
 
 		o = s.option(form.Value, 'probe_url', _('在线探针'));
@@ -207,25 +229,25 @@ return view.extend({
 		o.rmempty = true;
 
 		o = s.option(form.Value, 'poll_max', _('拨号轮询上限'));
-		o.datatype = 'uinteger';
+		o.datatype = 'range(1,200)';
 		o.default = '20';
 		o.depends('show_advanced', '1');
 		o.rmempty = true;
 
 		o = s.option(form.Value, 'poll_interval', _('拨询间隔'), _('秒。'));
-		o.datatype = 'uinteger';
+		o.datatype = 'range(1,60)';
 		o.default = '2';
 		o.depends('show_advanced', '1');
 		o.rmempty = true;
 
 		o = s.option(form.Value, 'curl_connect_timeout', _('连接超时'), _('秒。'));
-		o.datatype = 'uinteger';
+		o.datatype = 'range(1,60)';
 		o.default = '5';
 		o.depends('show_advanced', '1');
 		o.rmempty = true;
 
 		o = s.option(form.Value, 'curl_timeout', _('请求超时'), _('秒。'));
-		o.datatype = 'uinteger';
+		o.datatype = 'range(1,120)';
 		o.default = '12';
 		o.depends('show_advanced', '1');
 		o.rmempty = true;

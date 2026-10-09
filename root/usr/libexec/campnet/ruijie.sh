@@ -12,10 +12,12 @@ _auth_host() {
 	if [ -n "$S_AUTH_HOST" ]; then echo "$S_AUTH_HOST"; else echo "$S_GATEWAY"; fi
 }
 
-# --resolve 参数串（auth_host 是域名且给定了 server_ip 时）
+# --resolve 参数：写成全局数组变量再展开，避免依赖词分割
+# （原来返回一个字符串、调用处不引号展开，S_SERVER_IP 里一旦有空格就会散架）
 _resolve_args() {
+	RESOLVE_ARGS=""
 	if [ -n "$S_AUTH_HOST" ] && [ -n "$S_SERVER_IP" ]; then
-		echo "--resolve $S_AUTH_HOST:443:$S_SERVER_IP"
+		RESOLVE_ARGS="$S_AUTH_HOST:443:$S_SERVER_IP"
 	fi
 }
 
@@ -38,12 +40,15 @@ _ensure_auth_route() {
 # 外网拨号轮询（axe_bras 延迟拨号场景）
 _poll_auth_result() {
 	local dev="$1" acct_id="$2" page_id="$3" attempt=0 body host base rargs
-	host=$(_auth_host); base="https://$host"; rargs=$(_resolve_args)
+	host=$(_auth_host); base="https://$host"
+	_resolve_args
+	ARG_RESOLVE=""
+	[ -n "$RESOLVE_ARGS" ] && ARG_RESOLVE="--resolve $RESOLVE_ARGS"
 	while [ "$attempt" -lt "$S_POLL_MAX" ]; do
 		attempt=$((attempt + 1))
 		sleep "$S_POLL_INTERVAL"
 		verify_internet "$dev" && return 0
-		body=$(curl -skS -m 10 --interface "$dev" --noproxy '*' $rargs \
+		body=$(curl -skS -m 10 --interface "$dev" --noproxy '*' $ARG_RESOLVE \
 			-b "$CJ" -c "$CJ" \
 			-H "Host: $host" \
 			-H "Origin: $base" \
@@ -75,7 +80,10 @@ _poll_auth_result() {
 # ------------------------------------------------------------
 auth_ruijie() {
 	local dev="$DEV" host base rargs ip macl mac data resp attempt gw
-	host=$(_auth_host); base="https://$host"; rargs=$(_resolve_args)
+	host=$(_auth_host); base="https://$host"
+	_resolve_args
+	ARG_RESOLVE=""
+	[ -n "$RESOLVE_ARGS" ] && ARG_RESOLVE="--resolve $RESOLVE_ARGS"
 	# cookie 必须按**线路**隔离：同一账号挂两条线路时共用 cookie 会互相踩
 	CJ="$COOKIE_PREFIX.${LINE:-$ACCOUNT}.jar"
 	ip=$(dev_ip "$dev")
@@ -86,33 +94,45 @@ auth_ruijie() {
 	_ensure_auth_route "$dev"
 
 	# 1) Cookie 播种：先访问 BRAS/AC 首页（拿到会话 cookie 与门户下发字段）
+	# cookie 里是会话凭据：先建成 0600 再交给 curl，
+	# 别让 curl 按默认 umask 建出 0644 的文件。
 	rm -f "$CJ"
+	: > "$CJ" && chmod 600 "$CJ"
 	curl -skL -m "$S_TMO" --interface "$dev" --noproxy '*' \
 		-c "$CJ" "http://${S_GATEWAY}/" >/dev/null 2>&1
+	chmod 600 "$CJ" 2>/dev/null
 	# 认证域与网关不同（域名门户）时，再播种一次 HTTPS 根
 	if [ -n "$S_AUTH_HOST" ]; then
-		curl -sk -m "$S_TMO" --interface "$dev" --noproxy '*' $rargs \
+		curl -sk -m "$S_TMO" --interface "$dev" --noproxy '*' $ARG_RESOLVE \
 			-b "$CJ" -c "$CJ" "${base}/" >/dev/null 2>&1
+		chmod 600 "$CJ" 2>/dev/null
 	fi
 
-	# 2) 构造表单（键值均按调研记录，账号密码走 --data-urlencode）
+	# 2) 构造表单（键值均按调研记录）
 	data="wlanacip=${S_GATEWAY}&wlanacname=$(urlencode "$S_WLANACNAME")&wlanuserip=${ip}&mac=${macl}&vlan=${S_VLAN}"
 	data="${data}&scheme=https&serverIp=tomcat_server1:443&hostIp=http://127.0.0.1:8446/&loginType=&auth_type=${S_AUTH_TYPE}"
 	data="${data}&isBindMac1=0&pageid=${S_PAGEID}&templatetype=${S_TEMPLATETYPE}&listbindmac=0&recordmac=0&isRemind=1"
 	data="${data}&portalVer=0&tservertypeid=axe&realTerminalType=a&operatorastrict=0,1,2,3"
 	data="${data}&echostr=&loginTimes=&groupId=&url=http://${S_GATEWAY}/&remInfo=on"
+	data="${data}&userId=$(urlencode "$USERNAME")&passwd=$(urlencode "$PASSWORD")"
+
+	# 表单整包写进 0600 临时文件，用 --data @file 提交。
+	# 若直接用 --data/--data-urlencode 传参，账号密码会出现在 curl 的 argv 里，
+	# 同机任何进程读 /proc/<pid>/cmdline 都能看到。
+	body=$(camp_tmpfile campnet-body) || return 1
+	printf '%s' "$data" > "$body"
+	chmod 600 "$body"
 
 	log INFO "线路[${LINE:-$ACCOUNT}]（账号[$ACCOUNT]） POST ${base}/webauth.do (dev=$dev ip=$ip mac=$macl)"
-	resp=$(curl -sSki -m 30 --interface "$dev" --noproxy '*' $rargs \
+	resp=$(curl -sSki -m 30 --interface "$dev" --noproxy '*' $ARG_RESOLVE \
 		-b "$CJ" -c "$CJ" \
 		-H "Host: ${host}" \
 		-H "Origin: ${base}" \
 		-H "Referer: ${base}/webauth.do" \
 		-H "Content-Type: application/x-www-form-urlencoded" \
-		-d "$data" \
-		--data-urlencode "userId=${USERNAME}" \
-		--data-urlencode "passwd=${PASSWORD}" \
+		--data "@${body}" \
 		"${base}/webauth.do" 2>&1 || true)
+	rm -f "$body"
 
 	sleep 2
 

@@ -59,12 +59,18 @@ auth_eportal() {
 	post="userId=${u_enc}&password=${p_enc}&service="
 	post="${post}&queryString=${enc2}&operatorPwd=&operatorUserId=&validcode=&passwordEncrypt=false"
 
+	# 请求体写进 0600 临时文件再 --data @file：直接 --data 会把密码
+	# 留在 curl 的 argv 里（ps / /proc/<pid>/cmdline 可见）。
+	body=$(camp_tmpfile campnet-ep) || return 1
+	printf '%s' "$post" > "$body"
+	chmod 600 "$body"
 	resp=$(curl -sS -m 15 --interface "$dev" --noproxy '*' \
 		-X POST "http://$S_GATEWAY/eportal/InterFace.do?method=login" \
 		-H "User-Agent: Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.84 Safari/537.36" \
 		-H "Content-Type: application/x-www-form-urlencoded; charset=UTF-8" \
 		-H "Referer: http://$S_GATEWAY/eportal/index.jsp?${qs}" \
-		--data "$post" 2>&1 || true)
+		--data "@${body}" 2>&1 || true)
+	rm -f "$body"
 
 	result=$(printf '%s' "$resp" | jsonfilter -e '@.result' 2>/dev/null)
 	[ -n "$result" ] || result=$(printf '%s' "$resp" | sed -n 's/.*"result"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
@@ -84,6 +90,12 @@ auth_eportal() {
 	return 1
 }
 
+# 从门户 JSON 里取一个标量字段（文件作用域函数，不要塞进 portal_info 里
+# 每次重定义 —— 那样会污染全局命名空间，且 local 同名变量会遮蔽它）
+_pj() { # <json> <字段>
+	printf '%s' "$1" | jsonfilter -e "@.$2" 2>/dev/null | tr -d '\n\r' | cut -c1-64
+}
+
 # ------------------------------------------------------------
 # portal_info <dev> —— 取该线路上门户回传的实名信息
 # 输出 state 文件用的 key=value（无换行），取不到返回 1。
@@ -96,13 +108,10 @@ portal_info() {
 	[ -n "$body" ] || return 1
 	case "$body" in *'"result":"success"'*) ;; *) return 1 ;; esac
 
-	local _j
-	_j() { printf '%s' "$body" | jsonfilter -e "@.$1" 2>/dev/null | tr -d '\n\r' | cut -c1-64; }
-
-	printf 'pname=%s\n'  "$(_j userName)"
-	printf 'puser=%s\n'  "$(_j userId)"
-	printf 'pgroup=%s\n' "$(_j userGroup)"
-	printf 'pfee=%s\n'   "$(_j accountFee)"
-	printf 'pip=%s\n'    "$(_j userIp)"
-	printf 'pmac=%s\n'   "$(_j userMac)"
+	printf 'pname=%s\n'  "$(_pj "$body" userName)"
+	printf 'puser=%s\n'  "$(_pj "$body" userId)"
+	printf 'pgroup=%s\n' "$(_pj "$body" userGroup)"
+	printf 'pfee=%s\n'   "$(_pj "$body" accountFee)"
+	printf 'pip=%s\n'    "$(_pj "$body" userIp)"
+	printf 'pmac=%s\n'   "$(_pj "$body" userMac)"
 }
