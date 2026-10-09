@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 'require rpc';
 'require ui';
 
@@ -251,7 +252,17 @@ function poll(fn, ms, root) {
 	return function () { if (timer) window.clearTimeout(timer); };
 }
 
-return {
+/* 必须返回一个 Class，不能返回普通对象字面量。
+ * luci.js 的加载器是这么判的：
+ *     _class = _factory.apply(...);
+ *     if (!Class.isSubclass(_class)) raise('TypeError', '"%s" factory yields invalid constructor');
+ *     ...
+ *     const instance = new _class();  classes[name] = instance;  return instance;
+ * 也就是说模块工厂要交出**构造器**，加载器再 `new` 出实例交给 require。
+ * 返回 `{...}` 会在页面加载阶段直接抛
+ * `TypeError: "view.campnet.common" factory yields invalid constructor`，
+ * 三个页面全挂。form.js / uci.js / ui.js 都是这个形状，照抄即可。 */
+return baseclass.extend({
 	getStatus: getStatus,
 	getLog: getLog,
 	setSecret: setSecret,
@@ -270,4 +281,4 @@ return {
 	emptyText: emptyText,
 	settingsUrl: settingsUrl,
 	poll: poll
-};
+});
